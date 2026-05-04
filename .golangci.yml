@@ -1,0 +1,114 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  default: none
+  enable:
+    - bidichk
+    - bodyclose
+    - copyloopvar
+    - dupword
+    - durationcheck
+    - errcheck
+    - errorlint
+    - exhaustive
+    - forbidigo
+    - gocritic
+    - gosec
+    - govet
+    - ineffassign
+    - misspell
+    - nilerr
+    - noctx
+    - nolintlint
+    - perfsprint
+    - prealloc
+    - predeclared
+    - reassign
+    - revive
+    - staticcheck
+    - thelper
+    - unconvert
+    - unused
+    - usestdlibvars
+    - usetesting
+  settings:
+    errcheck:
+      check-type-assertions: true
+    exhaustive:
+      default-signifies-exhaustive: true
+    forbidigo:
+      # Strict prefix substitution is the project's whole correctness
+      # story. A naïve byte replace over Avro would corrupt
+      # lower_bounds/upper_bounds. Keep these out of the tree outside
+      # internal/rewrite/prefix.go.
+      forbid:
+        - pattern: '^strings\.Replace(All)?$'
+          msg: "use rewrite.PrefixMapping.Apply (strict prefix substitution; never byte replacement)"
+        - pattern: '^bytes\.Replace(All)?$'
+          msg: "use rewrite.PrefixMapping.Apply (strict prefix substitution; never byte replacement)"
+    gocritic:
+      disabled-checks:
+        - ifElseChain
+        - singleCaseSwitch
+    gosec:
+      excludes:
+        - G104 # duplicates errcheck
+        - G115 # noisy on legitimate int conversions
+    revive:
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: dot-imports
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+        - name: increment-decrement
+        - name: indent-error-flow
+        - name: range
+        - name: receiver-naming
+        - name: redefines-builtin-id
+        - name: superfluous-else
+        - name: time-naming
+        - name: unexported-return
+        - name: unreachable-code
+        - name: unused-parameter
+          disabled: true
+        - name: var-declaration
+        - name: var-naming
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gosec
+          - dupword
+          - prealloc
+          # forbidigo guards the *production* rewrite path: a stray
+          # strings.ReplaceAll over Avro bytes silently corrupts
+          # lower_bounds/upper_bounds. Tests compute expected URIs by
+          # path-prefix substitution all the time (they are not
+          # rewriting Avro), so exempt them.
+          - forbidigo
+      - path: test/harness/
+        linters:
+          - errcheck
+          - gosec
+          - dupword
+          - prealloc
+          - forbidigo
+
+formatters:
+  enable:
+    - gofumpt
+    - goimports
+  settings:
+    gofumpt:
+      extra-rules: true
+    goimports:
+      local-prefixes:
+        - github.com/fairtier/bergrebase

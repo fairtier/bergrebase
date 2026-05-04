@@ -1,0 +1,6 @@
+.idea/
+/bergrb
+/output/
+*.test
+*.prof
+.serena/

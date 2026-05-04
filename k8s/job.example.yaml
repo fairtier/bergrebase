@@ -1,0 +1,62 @@
+# Example bergrebase migration Job.
+#
+# Copy this file, edit the placeholder values (search for "CHANGE-ME"),
+# create the bergrebase-creds Secret with the keys referenced below, then
+# `kubectl apply -f` the result.
+#
+# Secret creation example:
+#
+#   kubectl create secret generic bergrebase-creds \
+#     --from-literal=catalog-token=... \
+#     --from-literal=source-access-key-id=... \
+#     --from-literal=source-secret-access-key=... \
+#     --from-literal=target-access-key-id=... \
+#     --from-literal=target-secret-access-key=...
+#
+# For a templated, multi-environment setup see ./base/ (Kustomize).
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bergrebase-rewrite
+  labels:
+    app.kubernetes.io/name: bergrebase
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: rewriter
+          image: ghcr.io/fairtier/bergrebase:v1.0.0
+          args:
+            - --catalog-uri=https://catalog.example.com/catalog       # CHANGE-ME
+            - --catalog-warehouse=warehouse                            # CHANGE-ME
+            - --catalog-token-from-env=CATALOG_TOKEN
+            - --source-prefix=s3://source-bucket/prefix/               # CHANGE-ME
+            - --target-prefix=s3://target-bucket/prefix/               # CHANGE-ME
+            - --target-endpoint=https://s3.target.example.com          # CHANGE-ME (omit line for AWS)
+            - --target-region=us-east-1                                # CHANGE-ME
+            - --target-path-style=false                                # CHANGE-ME (true for MinIO-style)
+            - --namespace=db                                           # CHANGE-ME
+            - --all-tables
+          env:
+            - name: CATALOG_TOKEN
+              valueFrom:
+                secretKeyRef: { name: bergrebase-creds, key: catalog-token }
+            - name: SOURCE_AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef: { name: bergrebase-creds, key: source-access-key-id }
+            - name: SOURCE_AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef: { name: bergrebase-creds, key: source-secret-access-key }
+            - name: TARGET_AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef: { name: bergrebase-creds, key: target-access-key-id }
+            - name: TARGET_AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef: { name: bergrebase-creds, key: target-secret-access-key }
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits:   { cpu: 1,    memory: 1Gi   }

@@ -1,0 +1,56 @@
+# Kustomize base for the bergrebase migration Job.
+#
+# An overlay must:
+#
+#   1. Provide a `bergrebase-config` ConfigMap with these keys:
+#        catalog-uri, catalog-warehouse,
+#        source-prefix, target-prefix,
+#        target-endpoint, target-region, target-path-style,
+#        iceberg-namespace
+#      (configMapGenerator with a literal list or a .env file).
+#
+#   2. Provide a `bergrebase-creds` Secret with these keys:
+#        catalog-token,
+#        source-access-key-id, source-secret-access-key,
+#        target-access-key-id, target-secret-access-key
+#      (out-of-band kubectl, sealed-secrets, ESO, or secretGenerator
+#      from a gitignored .env file).
+#
+#   3. Optionally pin a different image tag via `images:` (see below).
+#
+# Minimal overlay example:
+#
+#   # overlays/prod/kustomization.yaml
+#   apiVersion: kustomize.config.k8s.io/v1beta1
+#   kind: Kustomization
+#   resources:
+#     - ../../base
+#   configMapGenerator:
+#     - name: bergrebase-config
+#       behavior: create
+#       literals:
+#         - catalog-uri=https://catalog.prod.example.com/catalog
+#         - catalog-warehouse=warehouse
+#         - source-prefix=s3://src-bucket/prefix/
+#         - target-prefix=s3://dst-bucket/prefix/
+#         - target-endpoint=https://s3.dst.example.com
+#         - target-region=us-east-1
+#         - target-path-style=false
+#         - iceberg-namespace=db
+#   secretGenerator:
+#     - name: bergrebase-creds
+#       behavior: create
+#       envs: [creds.env]   # gitignored
+#   images:
+#     - name: ghcr.io/fairtier/bergrebase
+#       newTag: v1.0.0
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - job.yaml
+
+images:
+  - name: ghcr.io/fairtier/bergrebase
+    newTag: v1.0.0
