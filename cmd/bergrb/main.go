@@ -39,13 +39,14 @@ type config struct {
 	targetRegion    string
 	targetPathStyle bool
 
-	namespace   string
-	table       string
-	allTables   bool
-	dryRun      bool
-	currentOnly bool
-	keepGoing   bool
-	noValidate  bool
+	namespace     string
+	table         string
+	allTables     bool
+	allNamespaces bool
+	dryRun        bool
+	currentOnly   bool
+	keepGoing     bool
+	noValidate    bool
 }
 
 func parseFlags() (*config, error) {
@@ -65,9 +66,10 @@ func parseFlags() (*config, error) {
 	flag.StringVar(&c.targetRegion, "target-region", "", "S3 region for target")
 	flag.BoolVar(&c.targetPathStyle, "target-path-style", false, "use path-style addressing for target")
 
-	flag.StringVar(&c.namespace, "namespace", "", "Iceberg namespace (dot-separated, required)")
+	flag.StringVar(&c.namespace, "namespace", "", "Iceberg namespace (dot-separated; required unless --all-namespaces)")
 	flag.StringVar(&c.table, "table", "", "single table to migrate (mutually exclusive with --all-tables)")
 	flag.BoolVar(&c.allTables, "all-tables", false, "migrate every table in the namespace")
+	flag.BoolVar(&c.allNamespaces, "all-namespaces", false, "rebase every table in every namespace in the warehouse (mutually exclusive with --namespace, --table, --all-tables)")
 
 	flag.BoolVar(&c.dryRun, "dry-run", false, "walk the metadata graph and report planned changes; no writes")
 	flag.BoolVar(&c.currentOnly, "current-snapshot-only", false, "skip historical snapshots (breaks time travel)")
@@ -96,15 +98,32 @@ func (c *config) validate() error {
 	if c.targetPrefix == "" {
 		missing = append(missing, "--target-prefix")
 	}
-	if c.namespace == "" {
+	if !c.allNamespaces && c.namespace == "" {
 		missing = append(missing, "--namespace")
 	}
 	if len(missing) > 0 {
 		return fmt.Errorf("missing required flags: %s", strings.Join(missing, ", "))
 	}
-	hasTable := c.table != ""
-	if hasTable == c.allTables {
-		return errors.New("exactly one of --table or --all-tables is required")
+	if c.allNamespaces {
+		conflicts := []string{}
+		if c.namespace != "" {
+			conflicts = append(conflicts, "--namespace")
+		}
+		if c.table != "" {
+			conflicts = append(conflicts, "--table")
+		}
+		if c.allTables {
+			conflicts = append(conflicts, "--all-tables")
+		}
+		if len(conflicts) > 0 {
+			return fmt.Errorf("--all-namespaces is mutually exclusive with: %s",
+				strings.Join(conflicts, ", "))
+		}
+	} else {
+		hasTable := c.table != ""
+		if hasTable == c.allTables {
+			return errors.New("exactly one of --table or --all-tables is required")
+		}
 	}
 	if c.sourcePrefix == c.targetPrefix {
 		return errors.New("--source-prefix and --target-prefix must differ")
@@ -182,34 +201,130 @@ func run(ctx context.Context, cfg *config) error {
 		},
 	}
 
-	tables, err := selectTables(ctx, cat, cfg)
+	batches, err := selectBatches(ctx, cat, cfg)
 	if err != nil {
 		return fmt.Errorf("select tables: %w", err)
 	}
 
-	var firstErr error
-	for _, id := range tables {
-		if err := migrateOne(ctx, cat, engine, target, id, cfg); err != nil {
-			slog.Error("table migration failed", "table", qualifiedName(id), "err", err)
-			if firstErr == nil {
-				firstErr = err
+	var (
+		firstErr     error
+		totalOK      int
+		totalFailed  int
+		nsCount      int
+		multiSummary = cfg.allNamespaces
+	)
+	for _, batch := range batches {
+		nsCount++
+		var nsOK, nsFailed int
+		for _, id := range batch.tables {
+			if err := migrateOne(ctx, cat, engine, target, id, cfg); err != nil {
+				slog.Error("table migration failed", "table", qualifiedName(id), "err", err)
+				nsFailed++
+				if firstErr == nil {
+					firstErr = err
+				}
+				if !cfg.keepGoing {
+					if multiSummary {
+						slog.Info(
+							"namespace summary",
+							"namespace", namespaceLabel(batch.ns),
+							"rebased", nsOK,
+							"failed", nsFailed,
+						)
+					}
+					return err
+				}
+				continue
 			}
-			if !cfg.keepGoing {
-				return err
-			}
-			continue
+			nsOK++
+			slog.Info("table migrated", "table", qualifiedName(id))
 		}
-		slog.Info("table migrated", "table", qualifiedName(id))
+		totalOK += nsOK
+		totalFailed += nsFailed
+		if multiSummary {
+			slog.Info(
+				"namespace summary",
+				"namespace", namespaceLabel(batch.ns),
+				"rebased", nsOK,
+				"failed", nsFailed,
+			)
+		}
+	}
+	if multiSummary {
+		slog.Info(
+			"warehouse summary",
+			"namespaces", nsCount,
+			"rebased", totalOK,
+			"failed", totalFailed,
+		)
 	}
 	return firstErr
 }
 
-func selectTables(ctx context.Context, cat catalog.Catalog, cfg *config) ([]catalog.Identifier, error) {
+// nsBatch groups the tables to rebase in a single namespace.
+type nsBatch struct {
+	ns     catalog.Namespace
+	tables []catalog.Identifier
+}
+
+func selectBatches(ctx context.Context, cat catalog.Catalog, cfg *config) ([]nsBatch, error) {
+	if cfg.allNamespaces {
+		all, err := listAllNamespaces(ctx, cat)
+		if err != nil {
+			return nil, err
+		}
+		batches := make([]nsBatch, 0, len(all))
+		for _, ns := range all {
+			tables, err := cat.ListTables(ctx, ns)
+			if err != nil {
+				return nil, fmt.Errorf("list tables in %s: %w", namespaceLabel(ns), err)
+			}
+			batches = append(batches, nsBatch{ns: ns, tables: tables})
+		}
+		return batches, nil
+	}
 	ns := strings.Split(cfg.namespace, ".")
 	if cfg.allTables {
-		return cat.ListTables(ctx, ns)
+		tables, err := cat.ListTables(ctx, ns)
+		if err != nil {
+			return nil, err
+		}
+		return []nsBatch{{ns: ns, tables: tables}}, nil
 	}
-	return []catalog.Identifier{{Namespace: ns, Name: cfg.table}}, nil
+	return []nsBatch{{
+		ns:     ns,
+		tables: []catalog.Identifier{{Namespace: ns, Name: cfg.table}},
+	}}, nil
+}
+
+// listAllNamespaces walks the warehouse breadth-first, returning every
+// namespace (root and nested). Tables can live at any level so the caller
+// must call ListTables on each namespace returned, not only on leaves.
+func listAllNamespaces(ctx context.Context, cat catalog.Catalog) ([]catalog.Namespace, error) {
+	roots, err := cat.ListNamespaces(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("list root namespaces: %w", err)
+	}
+	all := make([]catalog.Namespace, 0, len(roots))
+	queue := append([]catalog.Namespace(nil), roots...)
+	for len(queue) > 0 {
+		ns := queue[0]
+		queue = queue[1:]
+		all = append(all, ns)
+		children, err := cat.ListNamespaces(ctx, ns)
+		if err != nil {
+			return nil, fmt.Errorf("list child namespaces of %s: %w", namespaceLabel(ns), err)
+		}
+		queue = append(queue, children...)
+	}
+	return all, nil
+}
+
+func namespaceLabel(ns catalog.Namespace) string {
+	if len(ns) == 0 {
+		return "<root>"
+	}
+	return strings.Join(ns, ".")
 }
 
 func migrateOne(ctx context.Context, cat catalog.Catalog, engine *rewrite.Engine, target rewrite.Storage, id catalog.Identifier, cfg *config) error {
@@ -222,7 +337,8 @@ func migrateOne(ctx context.Context, cat catalog.Catalog, engine *rewrite.Engine
 	if err != nil {
 		return fmt.Errorf("rewrite metadata: %w", err)
 	}
-	slog.Info("metadata rewritten",
+	slog.Info(
+		"metadata rewritten",
 		"old", res.OldMetadataLocation,
 		"new", res.NewMetadataLocation,
 		"manifest_lists", res.ManifestListsRewritten,

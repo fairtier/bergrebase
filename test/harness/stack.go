@@ -433,7 +433,9 @@ func (s *Stack) warehousePrefix(ctx context.Context) (string, error) {
 }
 
 // encodeNamespacePath joins multi-part namespaces with the U+001F unit
-// separator, the encoding the Iceberg REST spec mandates.
+// separator (the encoding the Iceberg REST spec mandates) and
+// URL-path-escapes the result so the U+001F survives http.NewRequest's
+// strict URL parsing.
 func encodeNamespacePath(ns []string) string {
-	return strings.Join(ns, "\x1f")
+	return url.PathEscape(strings.Join(ns, "\x1f"))
 }
