@@ -9,10 +9,21 @@ package catalog
 
 import "context"
 
+// Namespace is an Iceberg namespace path. Multipart namespaces (e.g.
+// "a.b.c") are represented as separate elements; single-level namespaces
+// have one element. An empty Namespace denotes the warehouse root and is
+// only meaningful as the parent argument to ListNamespaces.
+//
+// It is a type alias rather than a defined type so existing []string
+// literals at call sites continue to work without conversion. The alias
+// matches iceberg-go's table.Identifier shape (which is also = []string)
+// without forcing the iceberg-go/table import — that subpackage drags in
+// substrait, pterm, and other heavyweight deps the rewriter doesn't need.
+type Namespace = []string
+
 // Identifier is a fully-qualified table identifier within a warehouse.
-// Multipart namespaces (e.g. "a.b.c") are represented as separate elements.
 type Identifier struct {
-	Namespace []string
+	Namespace Namespace
 	Name      string
 }
 
@@ -33,8 +44,14 @@ type Table struct {
 // Implementations should be safe to call from a single goroutine; the
 // rewriter does not invoke them concurrently per table.
 type Catalog interface {
+	// ListNamespaces returns the immediate child namespaces of parent. A
+	// nil or empty parent lists top-level namespaces. Callers walk
+	// recursively (BFS/DFS) to enumerate every namespace in a warehouse;
+	// the spec does not provide a single-shot recursive listing.
+	ListNamespaces(ctx context.Context, parent Namespace) ([]Namespace, error)
+
 	// ListTables returns table identifiers within a namespace.
-	ListTables(ctx context.Context, ns []string) ([]Identifier, error)
+	ListTables(ctx context.Context, ns Namespace) ([]Identifier, error)
 
 	// LoadTable returns the current pointer state for a table.
 	LoadTable(ctx context.Context, id Identifier) (*Table, error)

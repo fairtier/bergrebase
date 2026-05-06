@@ -6,6 +6,7 @@
 //
 // Only the endpoints the rewriter actually exercises are implemented:
 //
+//   - GET    /v1/{prefix}/namespaces                                (ListNamespaces; ?parent=ns for nested)
 //   - GET    /v1/{prefix}/namespaces/{ns}/tables                    (ListTables)
 //   - GET    /v1/{prefix}/namespaces/{ns}/tables/{table}            (LoadTable)
 //   - DELETE /v1/{prefix}/namespaces/{ns}/tables/{table}            (DropTable)
@@ -232,15 +233,44 @@ func isAlreadyExists(err error) bool {
 	return false
 }
 
+// ListNamespaces returns the immediate child namespaces of parent. A nil
+// or empty parent lists top-level namespaces. The Iceberg REST spec does
+// not provide a recursive listing, so callers that want every namespace
+// in a warehouse must walk this method themselves.
+func (c *Client) ListNamespaces(ctx context.Context, parent catalog.Namespace) ([]catalog.Namespace, error) {
+	if err := c.init(ctx); err != nil {
+		return nil, err
+	}
+	u := c.v1Path("namespaces")
+	if len(parent) > 0 {
+		q := url.Values{}
+		// The parent query value uses the same U+001F separator the spec
+		// mandates for path segments; encodeNamespace already path-escapes,
+		// so go through the raw form and let url.Values escape it as a
+		// query value instead.
+		q.Set("parent", strings.Join(parent, "\x1f"))
+		u.RawQuery = q.Encode()
+	}
+	type listResponse struct {
+		Namespaces []catalog.Namespace `json:"namespaces"`
+	}
+	var resp listResponse
+	if err := c.do(ctx, http.MethodGet, u, nil, &resp); err != nil {
+		return nil, fmt.Errorf("rest: list namespaces under %q: %w",
+			strings.Join(parent, "."), err)
+	}
+	return resp.Namespaces, nil
+}
+
 // ListTables returns table identifiers within a namespace.
-func (c *Client) ListTables(ctx context.Context, ns []string) ([]catalog.Identifier, error) {
+func (c *Client) ListTables(ctx context.Context, ns catalog.Namespace) ([]catalog.Identifier, error) {
 	if err := c.init(ctx); err != nil {
 		return nil, err
 	}
 	u := c.v1Path("namespaces", encodeNamespace(ns), "tables")
 	type entry struct {
-		Namespace []string `json:"namespace"`
-		Name      string   `json:"name"`
+		Namespace catalog.Namespace `json:"namespace"`
+		Name      string            `json:"name"`
 	}
 	type listResponse struct {
 		Identifiers []entry `json:"identifiers"`
@@ -402,7 +432,7 @@ func (c *Client) registerTable(ctx context.Context, id catalog.Identifier, metad
 
 // encodeNamespace URL-encodes a multi-part namespace per the REST spec:
 // elements are joined with the unit-separator U+001F.
-func encodeNamespace(ns []string) string {
+func encodeNamespace(ns catalog.Namespace) string {
 	const sep = "\x1f"
 	return url.PathEscape(strings.Join(ns, sep))
 }

@@ -32,10 +32,11 @@ type fakeServer struct {
 	disableAtomic bool
 
 	// Per-handler overrides (set by individual tests).
-	registerHandler func(w http.ResponseWriter, r *http.Request)
-	dropHandler     func(w http.ResponseWriter, r *http.Request)
-	loadHandler     func(w http.ResponseWriter, r *http.Request)
-	listHandler     func(w http.ResponseWriter, r *http.Request)
+	registerHandler   func(w http.ResponseWriter, r *http.Request)
+	dropHandler       func(w http.ResponseWriter, r *http.Request)
+	loadHandler       func(w http.ResponseWriter, r *http.Request)
+	listHandler       func(w http.ResponseWriter, r *http.Request)
+	namespacesHandler func(w http.ResponseWriter, r *http.Request)
 }
 
 type recordedCall struct {
@@ -71,6 +72,18 @@ func newFakeServer(t *testing.T) *fakeServer {
 			}
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{"metadata-location":"s3://new/x.json","metadata":{}}`))
+		case strings.HasSuffix(r.URL.Path, "/namespaces") && r.Method == http.MethodGet:
+			if f.namespacesHandler != nil {
+				f.namespacesHandler(w, r)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"namespaces": [][]string{
+					{"bronze"},
+					{"silver"},
+					{"analytics"},
+				},
+			})
 		case strings.HasSuffix(r.URL.Path, "/tables") && r.Method == http.MethodGet:
 			if f.listHandler != nil {
 				f.listHandler(w, r)
@@ -157,6 +170,75 @@ func TestClient_ListTables(t *testing.T) {
 		if out[i].Name != w {
 			t.Errorf("[%d] = %q, want %q", i, out[i].Name, w)
 		}
+	}
+}
+
+func TestClient_ListNamespaces_Top(t *testing.T) {
+	f := newFakeServer(t)
+	c := New(Config{URI: f.srv.URL, Warehouse: "wh", Token: "tok"})
+	out, err := c.ListNamespaces(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListNamespaces: %v", err)
+	}
+	want := [][]string{{"bronze"}, {"silver"}, {"analytics"}}
+	if len(out) != len(want) {
+		t.Fatalf("got %d, want %d: %+v", len(out), len(want), out)
+	}
+	for i, w := range want {
+		if !sliceEq(out[i], w) {
+			t.Errorf("[%d] = %v, want %v", i, out[i], w)
+		}
+	}
+	call := lastCallMatching(f.calls, "/namespaces")
+	if call.Path != "/v1/ws-001/namespaces" {
+		t.Errorf("path = %q, want /v1/ws-001/namespaces", call.Path)
+	}
+	if call.Query != "" {
+		t.Errorf("top-level call must not carry parent, got query %q", call.Query)
+	}
+}
+
+// TestClient_ListNamespaces_NestedParent verifies that a multipart parent
+// is encoded with the spec-mandated U+001F separator in the parent query
+// value.
+func TestClient_ListNamespaces_NestedParent(t *testing.T) {
+	f := newFakeServer(t)
+	f.namespacesHandler = func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"namespaces": [][]string{
+				{"analytics", "exports", "eu"},
+			},
+		})
+	}
+	c := New(Config{URI: f.srv.URL, Token: "tok"})
+	out, err := c.ListNamespaces(context.Background(), []string{"analytics", "exports"})
+	if err != nil {
+		t.Fatalf("ListNamespaces: %v", err)
+	}
+	if len(out) != 1 || !sliceEq(out[0], []string{"analytics", "exports", "eu"}) {
+		t.Fatalf("unexpected children: %+v", out)
+	}
+	call := lastCallMatching(f.calls, "/namespaces")
+	// url.Values escapes U+001F as %1F in query values.
+	if !strings.Contains(strings.ToUpper(call.Query), "PARENT=ANALYTICS%1FEXPORTS") {
+		t.Errorf("query must encode multipart parent with U+001F, got %q", call.Query)
+	}
+}
+
+// TestClient_ListNamespaces_SinglePartParent verifies a single-element
+// parent is sent verbatim (no separator) since there is nothing to join.
+func TestClient_ListNamespaces_SinglePartParent(t *testing.T) {
+	f := newFakeServer(t)
+	f.namespacesHandler = func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"namespaces": [][]string{}})
+	}
+	c := New(Config{URI: f.srv.URL})
+	if _, err := c.ListNamespaces(context.Background(), []string{"analytics"}); err != nil {
+		t.Fatalf("ListNamespaces: %v", err)
+	}
+	call := lastCallMatching(f.calls, "/namespaces")
+	if call.Query != "parent=analytics" {
+		t.Errorf("query = %q, want parent=analytics", call.Query)
 	}
 }
 

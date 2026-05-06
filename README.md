@@ -85,12 +85,15 @@ bergrb \
 ```
 
 Other flags worth knowing: `--table` (single-table instead of
-`--all-tables`), `--keep-going` (continue past per-table failures rather
-than aborting the run), `--current-snapshot-only` (skip historical
-snapshots — faster, but breaks time travel), `--no-validate` (skip the
-post-migration check), `--source-path-style` / `--target-path-style` (for
-MinIO and other servers that need path-style addressing), and matching
-`--source-endpoint` / `--source-region` for source-side overrides.
+`--all-tables`), `--all-namespaces` (rebase every table in every
+namespace in the warehouse — mutually exclusive with `--namespace`,
+`--table`, and `--all-tables`), `--keep-going` (continue past per-table
+failures rather than aborting the run), `--current-snapshot-only` (skip
+historical snapshots — faster, but breaks time travel), `--no-validate`
+(skip the post-migration check), `--source-path-style` /
+`--target-path-style` (for MinIO and other servers that need path-style
+addressing), and matching `--source-endpoint` / `--source-region` for
+source-side overrides.
 
 Credentials for object storage are read from environment variables, with
 `SOURCE_*` and `TARGET_*` prefixes:
@@ -193,7 +196,8 @@ caller's responsibility — bergrebase doesn't take catalog locks.
   supports; rolls back on register failure.
 - S3-compatible storage via `aws-sdk-go-v2` with endpoint, region, and
   path-style overrides (works against AWS S3, R2, MinIO, etc.).
-- CLI with `--dry-run`, `--all-tables` / `--table`, `--keep-going`,
+- CLI with `--dry-run`, `--all-tables` / `--table`,
+  `--all-namespaces` for warehouse-wide rebases, `--keep-going`,
   `--current-snapshot-only`, `--no-validate`, and matching
   `--source-*` / `--target-*` storage flags.
 - Explicit refusal (`ErrUnsupportedFeature`) for V3 deletion vectors
