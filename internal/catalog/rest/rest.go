@@ -233,6 +233,15 @@ func isAlreadyExists(err error) bool {
 	return false
 }
 
+// isBadRequest reports whether err is an HTTP 400 rejection. Used by
+// the swap probe: a server that doesn't know the `overwrite` query
+// parameter may reject it with 400 rather than ignoring it, in which
+// case the drop+register fallback still works.
+func isBadRequest(err error) bool {
+	var herr *httpError
+	return errors.As(err, &herr) && herr.Status == http.StatusBadRequest
+}
+
 // ListNamespaces returns the immediate child namespaces of parent. A nil
 // or empty parent lists top-level namespaces. The Iceberg REST spec does
 // not provide a recursive listing, so callers that want every namespace
@@ -369,7 +378,21 @@ func (c *Client) SwapMetadataLocation(ctx context.Context, id catalog.Identifier
 			c.swapMode.Store(swapModeAtomic)
 			return nil
 		}
-		if !isAlreadyExists(err) {
+		switch {
+		case isAlreadyExists(err):
+			// Server treated overwrite=true as a plain register and
+			// rejected the duplicate. Cache that and fall back to
+			// drop+register for this swap.
+			c.swapMode.Store(swapModeDropRegister)
+			return c.swapByDropRegister(ctx, id, oldLocation, newLocation)
+		case isBadRequest(err):
+			// Some servers reject the unknown `overwrite` query
+			// parameter with 400 instead of ignoring it. Fall back for
+			// this swap, but don't cache the mode: a 400 can also mean a
+			// genuinely malformed request, and if the fallback register
+			// fails the same way it rolls back and surfaces the error.
+			return c.swapByDropRegister(ctx, id, oldLocation, newLocation)
+		default:
 			// Real failure (auth, transport, malformed metadata). Leave
 			// swapMode at unknown so the next swap can retry detection
 			// against a transient blip. Catalog is unchanged because the
@@ -377,25 +400,32 @@ func (c *Client) SwapMetadataLocation(ctx context.Context, id catalog.Identifier
 			return fmt.Errorf("rest: atomic register %s -> %s failed: %w",
 				qualifiedName(id), newLocation, err)
 		}
-		// Server treated overwrite=true as a plain register and rejected
-		// the duplicate. Cache that and fall back to drop+register for
-		// this swap.
-		c.swapMode.Store(swapModeDropRegister)
-		return c.swapByDropRegister(ctx, id, oldLocation, newLocation)
 	}
 }
 
 // swapByDropRegister implements the drop-without-purge + register path
 // with best-effort rollback if register fails.
+//
+// The whole critical section runs detached from the caller's
+// cancellation (with its own timeout): the caller's ctx is typically
+// wired to SIGINT/SIGTERM, and a Ctrl-C landing between a successful
+// drop and the register would otherwise cancel both the register AND
+// the rollback, stranding the table unregistered until manual repair.
+// Once the drop has been issued the swap must run to a terminal state.
 func (c *Client) swapByDropRegister(ctx context.Context, id catalog.Identifier, oldLocation, newLocation string) error {
-	if err := c.dropTable(ctx, id); err != nil {
+	// Generous bound: three HTTP calls, each capped by the transport's
+	// own timeout (30s default).
+	swapCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Minute)
+	defer cancel()
+
+	if err := c.dropTable(swapCtx, id); err != nil {
 		return fmt.Errorf("rest: drop %s: %w", qualifiedName(id), err)
 	}
-	if err := c.registerTable(ctx, id, newLocation, false); err != nil {
+	if err := c.registerTable(swapCtx, id, newLocation, false); err != nil {
 		// Best-effort rollback. Failure here is reported alongside the
 		// original error so the operator knows the table is currently
 		// unregistered.
-		if rbErr := c.registerTable(ctx, id, oldLocation, false); rbErr != nil {
+		if rbErr := c.registerTable(swapCtx, id, oldLocation, false); rbErr != nil {
 			return fmt.Errorf("rest: register %s -> %s failed: %w; rollback to %s also failed: %w",
 				qualifiedName(id), newLocation, err, oldLocation, rbErr)
 		}

@@ -81,6 +81,53 @@ func TestValidate_AllNamespacesMatrix(t *testing.T) {
 				c.table = "orders"
 			},
 		},
+		{
+			name: "source prefix without trailing slash rejected",
+			mut: func(c *config) {
+				c.namespace = "db"
+				c.table = "orders"
+				c.sourcePrefix = "s3://a/warehouse"
+			},
+			wantErr: "must end with '/'",
+		},
+		{
+			name: "target prefix without trailing slash rejected",
+			mut: func(c *config) {
+				c.namespace = "db"
+				c.table = "orders"
+				c.targetPrefix = "s3://b/warehouse"
+			},
+			wantErr: "must end with '/'",
+		},
+		{
+			name: "target nested under source rejected (breaks idempotency)",
+			mut: func(c *config) {
+				c.namespace = "db"
+				c.table = "orders"
+				c.sourcePrefix = "s3://b/x/"
+				c.targetPrefix = "s3://b/x/deep/"
+			},
+			wantErr: "must not be nested",
+		},
+		{
+			name: "source nested under target rejected",
+			mut: func(c *config) {
+				c.namespace = "db"
+				c.table = "orders"
+				c.sourcePrefix = "s3://b/x/deep/"
+				c.targetPrefix = "s3://b/x/"
+			},
+			wantErr: "must not be nested",
+		},
+		{
+			name: "negative max-object-size rejected",
+			mut: func(c *config) {
+				c.namespace = "db"
+				c.table = "orders"
+				c.maxObjectSize = -1
+			},
+			wantErr: "--max-object-size",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -153,6 +200,26 @@ func TestListAllNamespaces_BFSDescendsIntoNested(t *testing.T) {
 		if strings.Join(got[i], ".") != strings.Join(want[i], ".") {
 			t.Errorf("[%d] = %v, want %v", i, got[i], want[i])
 		}
+	}
+}
+
+// TestListAllNamespaces_CycleGuard feeds the BFS a catalog that lists a
+// namespace under itself; without the visited set the walk would loop
+// forever.
+func TestListAllNamespaces_CycleGuard(t *testing.T) {
+	cat := &fakeCatalog{
+		children: map[string][]catalog.Namespace{
+			"":            {{"loopy"}},
+			"loopy":       {{"loopy"}, {"loopy", "child"}},
+			"loopy.child": nil,
+		},
+	}
+	got, err := listAllNamespaces(context.Background(), cat)
+	if err != nil {
+		t.Fatalf("listAllNamespaces: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d namespaces, want 2 (loopy, loopy.child): %+v", len(got), got)
 	}
 }
 

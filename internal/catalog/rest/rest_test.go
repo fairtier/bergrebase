@@ -445,6 +445,41 @@ func TestClient_SwapMetadataLocation_FallbackOnAlreadyExists(t *testing.T) {
 	}
 }
 
+// TestClient_SwapMetadataLocation_FallbackOnBadRequest verifies that a
+// server rejecting the unknown `overwrite` query parameter with 400
+// still gets the drop+register fallback (for this swap only — a 400
+// can also be a genuinely malformed request, so the mode is not
+// cached).
+func TestClient_SwapMetadataLocation_FallbackOnBadRequest(t *testing.T) {
+	f := newFakeServer(t)
+	f.registerHandler = func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("overwrite") == "true" {
+			http.Error(w, `{"error":{"message":"unknown query parameter: overwrite","code":400}}`, http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"metadata-location":"s3://new/x.json","metadata":{}}`))
+	}
+	c := New(Config{URI: f.srv.URL, Token: "t"})
+	id := catalog.Identifier{Namespace: []string{"db"}, Name: "orders"}
+	if err := c.SwapMetadataLocation(context.Background(), id, "s3://old/v1.metadata.json", "s3://new/v2.metadata.json"); err != nil {
+		t.Fatalf("Swap: %v", err)
+	}
+	want := []string{
+		"GET /v1/config",
+		"GET /v1/ws-001/namespaces/db/tables/orders",
+		"POST /v1/ws-001/namespaces/db/register",        // probe → 400
+		"DELETE /v1/ws-001/namespaces/db/tables/orders", // drop
+		"POST /v1/ws-001/namespaces/db/register",        // fallback register
+	}
+	if got := formatCalls(f.calls); !sliceEq(got, want) {
+		t.Errorf("call sequence:\n got=%v\nwant=%v", got, want)
+	}
+	if got := c.swapMode.Load(); got != swapModeUnknown {
+		t.Errorf("swapMode should stay unknown after a 400 probe, got %d", got)
+	}
+}
+
 // TestClient_SwapMetadataLocation_AtomicCachedAfterSuccess verifies that
 // after a successful atomic swap the second swap on the same Client
 // goes straight to register?overwrite=true without re-probing.

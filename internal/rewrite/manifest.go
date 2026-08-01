@@ -103,6 +103,10 @@ func readManifestListHeader(raw []byte) (ManifestListHeader, int, error) {
 // Entry routing:
 //   - EntryContentData / EntryContentPosDeletes / EntryContentEqDeletes
 //     → report path hits for file_path and (if set) referenced_data_file.
+//   - EntryContentPosDeletes (Parquet, in scope) → additionally read the
+//     delete file's body via WalkPositionDeleteFile so a dry-run
+//     surfaces the same body-level failures (unparseable Parquet,
+//     foreign-prefix rows) the live rewrite would hit. No writes.
 //   - EntryContentPosDeletes with a .puffin file extension → refuse with
 //     ErrUnsupportedFeature (V3 deletion vectors live inside Puffin
 //     files, deferred to a separate Puffin-rewrite work item).
@@ -127,6 +131,9 @@ func WalkManifest(ctx context.Context, src Storage, mf iceberg.ManifestFile, map
 			if isPuffinPath(df.FilePath()) {
 				return nil, fmt.Errorf("%w: manifest %s entry %d points at Puffin file %s (V3 deletion vector)",
 					ErrUnsupportedFeature, mf.FilePath(), i, df.FilePath())
+			}
+			if err := WalkPositionDeleteFile(ctx, src, df.FilePath(), mapping); err != nil {
+				return nil, fmt.Errorf("dry-run position-delete %s: %w", df.FilePath(), err)
 			}
 		default:
 			return nil, fmt.Errorf("%w: manifest %s entry %d has content type %s",

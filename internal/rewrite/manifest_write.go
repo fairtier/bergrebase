@@ -26,8 +26,12 @@ import (
 //   - EntryContentData → rewrite file_path + referenced_data_file.
 //   - EntryContentPosDeletes (Parquet) → rewrite the Parquet body via
 //     RewritePositionDeleteFile (which mutates the file_path column
-//     inside the Parquet), then rewrite the manifest entry's file_path
-//     and referenced_data_file.
+//     inside the Parquet), then rewrite the manifest entry's file_path,
+//     referenced_data_file, the reserved file_path-column bounds
+//     (lower_bounds/upper_bounds for field id 2147483546 — engines use
+//     them to match delete files to data files), and file_size_in_bytes
+//     (the body re-encode can change the byte length; split_offsets and
+//     column_sizes describe the old layout and are cleared).
 //   - EntryContentPosDeletes (.puffin) → refuse with
 //     ErrUnsupportedFeature (V3 deletion vector territory).
 //   - EntryContentEqDeletes → rewrite file_path only. Equality-delete
@@ -80,9 +84,15 @@ func RewriteManifest(ctx context.Context, src, target Storage, mf iceberg.Manife
 			// column inside embeds absolute data-file URIs. The body
 			// rewriter is idempotent (no PUT if the file_path column
 			// already targets the new bucket).
-			if _, err := RewritePositionDeleteFile(ctx, src, target, df.FilePath(), mapping); err != nil {
+			pd, err := RewritePositionDeleteFile(ctx, src, target, df.FilePath(), mapping)
+			if err != nil {
 				return nil, nil, fmt.Errorf("rewrite position-delete %s: %w", df.FilePath(), err)
 			}
+			changed, err := fixupPositionDeleteEntryStats(df, pd, mapping)
+			if err != nil {
+				return nil, nil, fmt.Errorf("manifest %s entry %d: %w", mf.FilePath(), i, err)
+			}
+			mutated = mutated || changed
 		default:
 			return nil, nil, fmt.Errorf("%w: manifest %s entry %d has content type %s",
 				ErrUnsupportedFeature, mf.FilePath(), i, df.ContentType())
@@ -123,9 +133,41 @@ func RewriteManifest(ctx context.Context, src, target Storage, mf iceberg.Manife
 		return mf, hits, nil
 	}
 
+	// A manifest that lives outside the source prefix but references
+	// in-prefix entries (mixed-location table: prior partial migration,
+	// custom write.metadata.path history) cannot be rewritten safely:
+	// Apply is a no-op on its URI, so the write would overwrite the
+	// ORIGINAL manifest in place — mutating the live source table before
+	// any catalog swap. Refuse instead of silently corrupting.
+	if !mapping.Matches(mf.FilePath()) {
+		return nil, nil, fmt.Errorf("%w: manifest %s is outside source prefix %q but references in-prefix paths; rewriting would overwrite the original in place",
+			ErrOutsidePrefix, mf.FilePath(), mapping.Source)
+	}
+
 	newURI := mapping.Apply(mf.FilePath())
+	// Encode via NewManifestWriter rather than iceberg.WriteManifest:
+	// the latter always stamps `content: data` into the OCF header, so a
+	// rewritten DELETE manifest would self-identify as a data manifest
+	// and readers that validate the header against the manifest-list
+	// entry (iceberg-go among them — including this engine on a re-walk)
+	// reject the file.
 	buf := &bytes.Buffer{}
-	newMF, err := iceberg.WriteManifest(newURI, buf, mf.Version(), *spec, schema, mf.SnapshotID(), entries)
+	cw := &lengthCountingWriter{w: buf}
+	w, err := iceberg.NewManifestWriter(mf.Version(), cw, *spec, schema, mf.SnapshotID(),
+		iceberg.WithManifestWriterContent(mf.ManifestContent()))
+	if err != nil {
+		return nil, nil, fmt.Errorf("write manifest %s -> %s: %w", mf.FilePath(), newURI, err)
+	}
+	for _, entry := range entries {
+		if err := w.Add(entry); err != nil {
+			return nil, nil, fmt.Errorf("write manifest %s -> %s: %w", mf.FilePath(), newURI, err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		return nil, nil, fmt.Errorf("write manifest %s -> %s: %w", mf.FilePath(), newURI, err)
+	}
+	newMF, err := w.ToManifestFile(newURI, cw.n,
+		iceberg.WithManifestFileContent(mf.ManifestContent()))
 	if err != nil {
 		return nil, nil, fmt.Errorf("write manifest %s -> %s: %w", mf.FilePath(), newURI, err)
 	}
@@ -154,8 +196,13 @@ func RewriteManifest(ctx context.Context, src, target Storage, mf iceberg.Manife
 // not the manifest file body). Without preserving it, a delete
 // manifest would silently turn into a data manifest in the rewritten
 // list and readers would mis-route entries.
+//
+// Partition summaries (field id 507) come from newMF:
+// iceberg.WriteManifest recomputes them from the entries it just
+// wrote. Dropping them would silently cost engines manifest-level
+// partition pruning on every migrated table.
 func preserveSequenceNumbers(newMF, originalMF iceberg.ManifestFile) iceberg.ManifestFile {
-	return iceberg.NewManifestFile(
+	b := iceberg.NewManifestFile(
 		newMF.Version(),
 		newMF.FilePath(),
 		newMF.Length(),
@@ -170,8 +217,11 @@ func preserveSequenceNumbers(newMF, originalMF iceberg.ManifestFile) iceberg.Man
 		ExistingRows(newMF.ExistingRows()).
 		DeletedFiles(newMF.DeletedDataFiles()).
 		DeletedRows(newMF.DeletedRows()).
-		KeyMetadata(newMF.KeyMetadata()).
-		Build()
+		KeyMetadata(newMF.KeyMetadata())
+	if p := newMF.Partitions(); len(p) > 0 {
+		b = b.Partitions(p)
+	}
+	return b.Build()
 }
 
 // RewriteManifestList writes a new manifest list at the URI substituted
@@ -219,6 +269,143 @@ type ManifestListHeader struct {
 	ParentSnapshotID *int64
 	SequenceNumber   *int64 // V2/V3 only; nil for V1
 	FirstRowID       int64  // V3 only
+}
+
+// lengthCountingWriter counts bytes written through it. The manifest
+// writer needs the exact encoded length to stamp manifest_length into
+// the parent list entry (iceberg-go's own CountingWriter lives in an
+// internal package).
+type lengthCountingWriter struct {
+	n int64
+	w interface {
+		Write(p []byte) (int, error)
+	}
+}
+
+func (cw *lengthCountingWriter) Write(p []byte) (int, error) {
+	n, err := cw.w.Write(p)
+	cw.n += int64(n)
+	return n, err
+}
+
+// reservedFieldIDFilePath is the Iceberg reserved field id of the
+// file_path column in position-delete files (table spec: 2147483546).
+// V2 position-delete manifest entries carry lower/upper bounds for this
+// column holding absolute data-file URIs; engines built on Iceberg Java
+// (Spark, Trino, Flink — via DeleteFileIndex) use those bounds to decide
+// which delete files apply to which data files.
+const reservedFieldIDFilePath = 2147483546
+
+// fixupPositionDeleteEntryStats aligns a position-delete manifest
+// entry's statistics with the rewritten Parquet body:
+//
+//   - lower_bounds/upper_bounds for the reserved file_path column hold
+//     absolute data-file URIs by spec — paths, not user data — so the
+//     strict prefix substitution applies to them. Left stale, engines
+//     never match the delete file against the moved data files and
+//     deleted rows silently resurrect.
+//   - file_size_in_bytes must equal the re-encoded body's length, or
+//     readers look for the Parquet footer at the wrong offset.
+//   - split_offsets and column_sizes describe the original byte layout.
+//     Both are optional per spec, so they are cleared rather than
+//     recomputed.
+//
+// pd.NewSize < 0 means the delete file was out of scope and untouched;
+// the entry's stats are still valid and nothing is mutated.
+func fixupPositionDeleteEntryStats(df iceberg.DataFile, pd PositionDeleteRewrite, mapping PrefixMapping) (bool, error) {
+	if pd.NewSize < 0 {
+		return false, nil
+	}
+	changed, err := rewriteDataFileBoundsForField(df, reservedFieldIDFilePath, mapping)
+	if err != nil {
+		return changed, err
+	}
+	if df.FileSizeBytes() != pd.NewSize {
+		if err := setDataFileSize(df, pd.NewSize); err != nil {
+			return changed, err
+		}
+		changed = true
+	}
+	for _, field := range []string{"Splits", "ColSizes"} {
+		cleared, err := clearDataFileOptionalField(df, field)
+		if err != nil {
+			return changed, err
+		}
+		changed = changed || cleared
+	}
+	return changed, nil
+}
+
+// rewriteDataFileBoundsForField applies mapping to the lower_bounds /
+// upper_bounds values of a single field id on df. Only values that
+// begin with mapping.Source are touched — bounds of every other column
+// are user data and must never be rewritten (design rule D4). Bounds
+// may be writer-truncated and then no longer carry the full source
+// prefix; those are left alone (strict prefix rule; a truncated bound
+// widens matching, it cannot exclude the file).
+func rewriteDataFileBoundsForField(df iceberg.DataFile, fieldID int, mapping PrefixMapping) (bool, error) {
+	changed := false
+	for _, name := range []string{"LowerBounds", "UpperBounds"} {
+		field, err := dataFileField(df, name)
+		if err != nil {
+			return changed, err
+		}
+		if field.Kind() != reflect.Pointer || field.Type().Elem().Kind() != reflect.Slice {
+			return changed, fmt.Errorf("DataFile.%s is %s, expected *[]colMap (iceberg-go API drift?)", name, field.Type())
+		}
+		if field.IsNil() {
+			continue
+		}
+		slice := field.Elem()
+		for i := 0; i < slice.Len(); i++ {
+			elem := slice.Index(i)
+			key := elem.FieldByName("Key")
+			val := elem.FieldByName("Value")
+			if !key.IsValid() || !val.IsValid() ||
+				key.Kind() != reflect.Int || val.Type() != reflect.TypeFor[[]byte]() {
+				return changed, fmt.Errorf("DataFile.%s element is not colMap[int, []byte] (iceberg-go API drift?)", name)
+			}
+			if int(key.Int()) != fieldID {
+				continue
+			}
+			old := string(val.Bytes())
+			if next := mapping.Apply(old); next != old {
+				val.SetBytes([]byte(next))
+				changed = true
+			}
+		}
+	}
+	return changed, nil
+}
+
+// setDataFileSize mutates file_size_in_bytes on an iceberg-go DataFile.
+func setDataFileSize(df iceberg.DataFile, size int64) error {
+	field, err := dataFileField(df, "FileSize")
+	if err != nil {
+		return err
+	}
+	if field.Kind() != reflect.Int64 {
+		return fmt.Errorf("DataFile.FileSize is %s, expected int64", field.Kind())
+	}
+	field.SetInt(size)
+	return nil
+}
+
+// clearDataFileOptionalField nils an optional (pointer-typed) DataFile
+// field. Returns whether the field was previously set.
+func clearDataFileOptionalField(df iceberg.DataFile, name string) (bool, error) {
+	field, err := dataFileField(df, name)
+	if err != nil {
+		return false, err
+	}
+	if field.Kind() != reflect.Pointer {
+		return false, fmt.Errorf("DataFile.%s is %s, expected pointer", name, field.Kind())
+	}
+	if field.IsNil() {
+		return false, nil
+	}
+	field.Set(reflect.Zero(field.Type()))
+	return true, nil
 }
 
 // setDataFilePath mutates the file_path field on an iceberg-go DataFile

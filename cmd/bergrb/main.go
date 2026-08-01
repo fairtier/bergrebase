@@ -47,6 +47,8 @@ type config struct {
 	currentOnly   bool
 	keepGoing     bool
 	noValidate    bool
+
+	maxObjectSize int64
 }
 
 func parseFlags() (*config, error) {
@@ -70,6 +72,8 @@ func parseFlags() (*config, error) {
 	flag.StringVar(&c.table, "table", "", "single table to migrate (mutually exclusive with --all-tables)")
 	flag.BoolVar(&c.allTables, "all-tables", false, "migrate every table in the namespace")
 	flag.BoolVar(&c.allNamespaces, "all-namespaces", false, "rebase every table in every namespace in the warehouse (mutually exclusive with --namespace, --table, --all-tables)")
+
+	flag.Int64Var(&c.maxObjectSize, "max-object-size", 0, "cap in bytes on any single object read; 0 uses the default (256 MiB). Raise for very large metadata.json or position-delete files")
 
 	flag.BoolVar(&c.dryRun, "dry-run", false, "walk the metadata graph and report planned changes; no writes")
 	flag.BoolVar(&c.currentOnly, "current-snapshot-only", false, "skip historical snapshots (breaks time travel)")
@@ -128,6 +132,24 @@ func (c *config) validate() error {
 	if c.sourcePrefix == c.targetPrefix {
 		return errors.New("--source-prefix and --target-prefix must differ")
 	}
+	// A slash-less prefix also matches sibling paths ("s3://b/warehouse"
+	// matches "s3://b/warehouse2/…"), silently rebasing tables the bulk
+	// copy never covered.
+	if !strings.HasSuffix(c.sourcePrefix, "/") {
+		return fmt.Errorf("--source-prefix %q must end with '/'", c.sourcePrefix)
+	}
+	if !strings.HasSuffix(c.targetPrefix, "/") {
+		return fmt.Errorf("--target-prefix %q must end with '/'", c.targetPrefix)
+	}
+	// Nested prefixes break idempotency: with the target under the
+	// source, every rewritten path still matches the source prefix and a
+	// re-run rewrites it again (s3://b/x/deep/deep/…).
+	if strings.HasPrefix(c.targetPrefix, c.sourcePrefix) || strings.HasPrefix(c.sourcePrefix, c.targetPrefix) {
+		return errors.New("--source-prefix and --target-prefix must not be nested one under the other")
+	}
+	if c.maxObjectSize < 0 {
+		return errors.New("--max-object-size must be >= 0")
+	}
 	return nil
 }
 
@@ -163,6 +185,10 @@ func run(ctx context.Context, cfg *config) error {
 	// can't tell which catalogs need one. cfg.dryRun has no bearing on
 	// auth: dry-run still calls LoadTable / ListTables.
 	token := os.Getenv(cfg.catalogTokenEnv)
+	if token != "" && strings.HasPrefix(cfg.catalogURI, "http://") {
+		slog.Warn("catalog URI uses plain http with a bearer token; the token travels in cleartext",
+			"catalog_uri", cfg.catalogURI)
+	}
 
 	cat := rest.New(rest.Config{
 		URI:       cfg.catalogURI,
@@ -170,22 +196,33 @@ func run(ctx context.Context, cfg *config) error {
 		Token:     token,
 	})
 
+	sourceCreds, err := sideCredentials("SOURCE")
+	if err != nil {
+		return err
+	}
+	targetCreds, err := sideCredentials("TARGET")
+	if err != nil {
+		return err
+	}
+
 	source := storage.New(storage.Config{
 		Region:          cfg.sourceRegion,
 		Endpoint:        cfg.sourceEndpoint,
 		PathStyle:       cfg.sourcePathStyle,
-		AccessKeyID:     os.Getenv("SOURCE_AWS_ACCESS_KEY_ID"),
-		SecretAccessKey: os.Getenv("SOURCE_AWS_SECRET_ACCESS_KEY"),
-		SessionToken:    os.Getenv("SOURCE_AWS_SESSION_TOKEN"),
+		AccessKeyID:     sourceCreds.accessKeyID,
+		SecretAccessKey: sourceCreds.secretAccessKey,
+		SessionToken:    sourceCreds.sessionToken,
+		MaxObjectSize:   cfg.maxObjectSize,
 	})
 
 	target := storage.New(storage.Config{
 		Region:          cfg.targetRegion,
 		Endpoint:        cfg.targetEndpoint,
 		PathStyle:       cfg.targetPathStyle,
-		AccessKeyID:     os.Getenv("TARGET_AWS_ACCESS_KEY_ID"),
-		SecretAccessKey: os.Getenv("TARGET_AWS_SECRET_ACCESS_KEY"),
-		SessionToken:    os.Getenv("TARGET_AWS_SESSION_TOKEN"),
+		AccessKeyID:     targetCreds.accessKeyID,
+		SecretAccessKey: targetCreds.secretAccessKey,
+		SessionToken:    targetCreds.sessionToken,
+		MaxObjectSize:   cfg.maxObjectSize,
 	})
 
 	engine := &rewrite.Engine{
@@ -261,6 +298,41 @@ func run(ctx context.Context, cfg *config) error {
 	return firstErr
 }
 
+// awsCredentials is one side's static credential triple.
+type awsCredentials struct {
+	accessKeyID     string
+	secretAccessKey string
+	sessionToken    string
+}
+
+// sideCredentials reads the <SIDE>_AWS_* env triple for one side of the
+// migration and logs which credential source that side will use. In a
+// two-account migration tool a silent fall-through to the SDK default
+// chain (env AWS_*, shared config, IMDS) can sign writes with the wrong
+// identity, so the fallback is loud, and a half-set key pair — almost
+// always a typo in one of the variable names — is an error rather than
+// a silent fallback.
+func sideCredentials(side string) (awsCredentials, error) {
+	creds := awsCredentials{
+		accessKeyID:     os.Getenv(side + "_AWS_ACCESS_KEY_ID"),
+		secretAccessKey: os.Getenv(side + "_AWS_SECRET_ACCESS_KEY"),
+		sessionToken:    os.Getenv(side + "_AWS_SESSION_TOKEN"),
+	}
+	if (creds.accessKeyID == "") != (creds.secretAccessKey == "") {
+		return awsCredentials{}, fmt.Errorf(
+			"%s_AWS_ACCESS_KEY_ID and %s_AWS_SECRET_ACCESS_KEY must be set together (exactly one is set — typo in the variable name?)",
+			side, side)
+	}
+	if creds.accessKeyID == "" {
+		slog.Warn("no static credentials in env; using the AWS SDK default chain (env AWS_*, shared config, IMDS)",
+			"side", strings.ToLower(side), "env_vars", side+"_AWS_ACCESS_KEY_ID/"+side+"_AWS_SECRET_ACCESS_KEY")
+	} else {
+		slog.Info("using static credentials from env",
+			"side", strings.ToLower(side), "access_key_id_env", side+"_AWS_ACCESS_KEY_ID")
+	}
+	return creds, nil
+}
+
 // nsBatch groups the tables to rebase in a single namespace.
 type nsBatch struct {
 	ns     catalog.Namespace
@@ -300,16 +372,29 @@ func selectBatches(ctx context.Context, cat catalog.Catalog, cfg *config) ([]nsB
 // listAllNamespaces walks the warehouse breadth-first, returning every
 // namespace (root and nested). Tables can live at any level so the caller
 // must call ListTables on each namespace returned, not only on leaves.
+//
+// The visited set guards against a buggy catalog listing a namespace
+// under itself (or any other cycle), which would otherwise loop forever
+// and grow the queue unboundedly.
 func listAllNamespaces(ctx context.Context, cat catalog.Catalog) ([]catalog.Namespace, error) {
 	roots, err := cat.ListNamespaces(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("list root namespaces: %w", err)
 	}
 	all := make([]catalog.Namespace, 0, len(roots))
+	visited := make(map[string]bool, len(roots))
 	queue := append([]catalog.Namespace(nil), roots...)
 	for len(queue) > 0 {
 		ns := queue[0]
 		queue = queue[1:]
+		// Join with the same U+001F separator the REST spec uses for
+		// path segments — it cannot appear inside a namespace element,
+		// so the key is collision-free (unlike ".").
+		key := strings.Join(ns, "\x1f")
+		if visited[key] {
+			continue
+		}
+		visited[key] = true
 		all = append(all, ns)
 		children, err := cat.ListNamespaces(ctx, ns)
 		if err != nil {
@@ -331,6 +416,17 @@ func migrateOne(ctx context.Context, cat catalog.Catalog, engine *rewrite.Engine
 	tbl, err := cat.LoadTable(ctx, id)
 	if err != nil {
 		return fmt.Errorf("load table: %w", err)
+	}
+
+	// After a successful swap the pointer starts with the target prefix.
+	// Treat that as "already migrated" rather than failing the
+	// source-prefix check inside RewriteTable, so a re-run over a
+	// partially migrated namespace converges instead of erroring on the
+	// tables that already made it across.
+	if strings.HasPrefix(tbl.MetadataLocation, cfg.targetPrefix) {
+		slog.Info("table already migrated; skipping",
+			"table", qualifiedName(id), "metadata_location", tbl.MetadataLocation)
+		return nil
 	}
 
 	res, err := engine.RewriteTable(ctx, tbl.MetadataLocation)

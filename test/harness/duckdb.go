@@ -62,6 +62,18 @@ func probeDuckDB() {
 		duckdbProbeErr = fmt.Errorf("duckdb %s too old for iceberg_scan(metadata.json); need ≥ 1.1.3", version)
 		return
 	}
+
+	// Warm the extension cache once, with its own generous deadline. On a
+	// cold ~/.duckdb the INSTALLs download from extensions.duckdb.org; on a
+	// slow network that download alone can eat the whole 60 s per-scan
+	// budget in QueryIcebergScan and kill the first oracle tests of a run
+	// with an empty-output "signal: killed".
+	ictx, icancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer icancel()
+	if out, err := exec.CommandContext(ictx, bin, "-c", "INSTALL iceberg; INSTALL httpfs;").CombinedOutput(); err != nil {
+		duckdbProbeErr = fmt.Errorf("duckdb INSTALL iceberg/httpfs failed (network needed on first run): %w\n%s", err, out)
+		return
+	}
 	duckdbBinary = bin
 }
 

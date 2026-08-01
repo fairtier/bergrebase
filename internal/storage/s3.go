@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/url"
 	"strings"
 	"sync"
 
@@ -33,19 +32,22 @@ type Config struct {
 	SecretAccessKey string
 	SessionToken    string
 
-	// MaxObjectSize caps GetObject reads. Iceberg metadata files are
-	// KB-MB sized in practice; the cap exists so that a misconfigured
-	// run pointed at a data-file URI by mistake fails loudly instead
-	// of OOM-ing the process. Zero means use the package default
-	// (DefaultMaxObjectSize).
+	// MaxObjectSize caps GetObject reads. The cap exists so that a
+	// misconfigured run pointed at a huge data-file URI by mistake
+	// fails loudly instead of OOM-ing the process. Zero means use the
+	// package default (DefaultMaxObjectSize). Wired to the
+	// --max-object-size CLI flag.
 	MaxObjectSize int64
 }
 
 // DefaultMaxObjectSize bounds a single GetObject body. Iceberg
 // metadata.json and manifest list / manifest files are at most a few
-// MB even on wide V2 tables; 64 MiB is a generous safety net that
-// still rules out 10 GB Parquet files.
-const DefaultMaxObjectSize = 64 << 20
+// MB even on wide V2 tables, but the rewriter also reads V2
+// position-delete Parquet bodies and long-lived tables can accumulate
+// metadata.json documents of tens of MB (thousands of retained
+// snapshots). 256 MiB accommodates those while still ruling out
+// multi-GB Parquet data files.
+const DefaultMaxObjectSize = 256 << 20
 
 // Client is an S3-compatible object client. It lazily constructs the
 // underlying aws-sdk-go-v2 s3.Client on first use so that callers can
@@ -122,7 +124,7 @@ func (c *Client) GetObject(ctx context.Context, uri string) ([]byte, error) {
 		return nil, fmt.Errorf("storage: read %s: %w", uri, err)
 	}
 	if n > limit {
-		return nil, fmt.Errorf("storage: %s exceeds MaxObjectSize=%d (Storage is for metadata files only; pointing at a data-file URI is a configuration error)",
+		return nil, fmt.Errorf("storage: %s exceeds the per-object read cap of %d bytes; if this is a legitimately large metadata or position-delete file, raise the cap with --max-object-size",
 			uri, limit)
 	}
 	return buf.Bytes(), nil
@@ -167,7 +169,11 @@ func (c *Client) HeadObject(ctx context.Context, uri string) (int64, error) {
 		return 0, fmt.Errorf("storage: head %s: %w", uri, err)
 	}
 	if out.ContentLength == nil {
-		return 0, nil
+		// A nil ContentLength would otherwise flow onward as size 0 and
+		// produce confusing downstream failures (bogus "storage
+		// truncated?" from putAndVerify, size-0 V1 manifest
+		// descriptors). No compliant S3 implementation omits it.
+		return 0, fmt.Errorf("storage: head %s: server returned no Content-Length", uri)
 	}
 	return *out.ContentLength, nil
 }
@@ -175,22 +181,26 @@ func (c *Client) HeadObject(ctx context.Context, uri string) (int64, error) {
 // ParseS3URI splits an "s3://bucket/key" URI into its bucket and key
 // components. The key may contain forward slashes; an empty key is an
 // error since every Iceberg path is an object, not a bucket root.
+//
+// The split is a literal string cut, NOT url.Parse: Iceberg data paths
+// routinely contain Hive-style percent-escaped partition values (e.g.
+// "ts_hour=2024-01-01-00%3A00/..."), and url.Parse would decode them —
+// yielding a key that names a different S3 object — or reject a bare
+// '%' outright. S3 keys are raw bytes; the URI stores them verbatim.
 func ParseS3URI(uri string) (bucket, key string, err error) {
-	u, parseErr := url.Parse(uri)
-	if parseErr != nil {
-		return "", "", fmt.Errorf("storage: parse %q: %w", uri, parseErr)
+	rest, ok := strings.CutPrefix(uri, "s3://")
+	if !ok {
+		scheme, _, _ := strings.Cut(uri, "://")
+		return "", "", fmt.Errorf("storage: unsupported scheme %q in %q (want s3://)", scheme, uri)
 	}
-	if u.Scheme != "s3" {
-		return "", "", fmt.Errorf("storage: unsupported scheme %q in %q (want s3://)", u.Scheme, uri)
-	}
-	if u.Host == "" {
+	bucket, key, _ = strings.Cut(rest, "/")
+	if bucket == "" {
 		return "", "", fmt.Errorf("storage: missing bucket in %q", uri)
 	}
-	key = strings.TrimPrefix(u.Path, "/")
 	if key == "" {
 		return "", "", fmt.Errorf("storage: missing key in %q", uri)
 	}
-	return u.Host, key, nil
+	return bucket, key, nil
 }
 
 // Compile-time check that *Client satisfies the package-private subset of

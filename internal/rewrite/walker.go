@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	iceberg "github.com/apache/iceberg-go"
 )
@@ -14,10 +15,12 @@ import (
 // and writes back to the target storage. In the common case of a same-key
 // migration, both point at the new bucket but with the new credentials.
 //
-// Storage is only ever pointed at Iceberg metadata files (metadata.json,
-// manifest lists, manifests, statistics files). Implementations are free
-// to enforce a size cap on GetObject — a multi-GB Parquet data file is
-// always a configuration mistake, never legitimate input.
+// Storage reads Iceberg metadata files (metadata.json, manifest lists,
+// manifests, statistics files) and V2 position-delete Parquet bodies.
+// Implementations may enforce a size cap on GetObject to keep a
+// misconfigured run pointed at a multi-GB data file from OOM-ing the
+// process, but the cap must leave room for large position-delete files
+// and long-lived metadata.json documents (see storage.DefaultMaxObjectSize).
 type Storage interface {
 	GetObject(ctx context.Context, uri string) ([]byte, error)
 	PutObject(ctx context.Context, uri string, body []byte) error
@@ -57,6 +60,15 @@ type Engine struct {
 // --keep-going, log and continue to the next table.
 var ErrUnsupportedFeature = errors.New("iceberg feature not yet supported by rewriter")
 
+// ErrOutsidePrefix is returned when a metadata file that lives outside
+// the source prefix references in-prefix paths (mixed-location table:
+// prior partial migration, custom write.metadata.path history).
+// Rewriting such a file would overwrite the ORIGINAL object in place —
+// before any catalog swap — because the prefix substitution is a no-op
+// on its URI. The engine refuses rather than silently mutating the
+// live source table.
+var ErrOutsidePrefix = errors.New("metadata file outside source prefix references in-prefix paths")
+
 // RewriteResult summarises the work done for a single table.
 type RewriteResult struct {
 	OldMetadataLocation string
@@ -64,7 +76,11 @@ type RewriteResult struct {
 
 	ManifestListsRewritten int
 	ManifestsRewritten     int
-	StatsFilesRewritten    int
+	// StatsFilesRewritten counts statistics-path / partition-statistics
+	// entries in metadata.json that were re-pointed at the target
+	// prefix. The stats file bodies themselves carry no paths in v1, so
+	// only the pointers move.
+	StatsFilesRewritten int
 
 	// Skipped is non-empty if --keep-going masked an unsupported feature.
 	Skipped []string
@@ -149,6 +165,13 @@ func (e *Engine) RewriteTable(ctx context.Context, oldMetadataLocation string) (
 			// unchanged AND (b) the list URI itself is out-of-prefix.
 			listURIChanged := e.Opts.Mapping.Apply(snap.ManifestList) != snap.ManifestList
 			if !e.Opts.DryRun && (subtreeChanged || listURIChanged) {
+				// Same refusal as RewriteManifest's: a list whose own URI
+				// is out-of-prefix would be overwritten at its ORIGINAL
+				// location, mutating the live source table pre-swap.
+				if subtreeChanged && !e.Opts.Mapping.Matches(snap.ManifestList) {
+					return res, fmt.Errorf("%w: manifest list %s is outside source prefix %q but its manifests changed",
+						ErrOutsidePrefix, snap.ManifestList, e.Opts.Mapping.Source)
+				}
 				if _, err := RewriteManifestList(ctx, e.Target, snap.ManifestList, e.Opts.Mapping, version, hdr, rewrittenFiles); err != nil {
 					return res, err
 				}
@@ -207,6 +230,11 @@ func (e *Engine) RewriteTable(ctx context.Context, oldMetadataLocation string) (
 	// dry-run-style hits from the walk are useful for auditing, and the
 	// write-path hits prove the mutation took effect.
 	res.Hits = append(res.Hits, metaHits...)
+	for _, h := range metaHits {
+		if strings.Contains(h.Field, "statistics-path") && h.Rewritten() {
+			res.StatsFilesRewritten++
+		}
+	}
 	return res, nil
 }
 

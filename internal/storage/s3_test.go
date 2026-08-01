@@ -23,6 +23,20 @@ func TestParseS3URI(t *testing.T) {
 			key:    "dir/v1.metadata.json",
 		},
 		{
+			// Hive-style escaped partition values must stay literal —
+			// url.Parse-style decoding would name a different object.
+			name:   "percent-escaped partition value kept verbatim",
+			in:     "s3://bucket/wh/t/data/ts_hour=2024-01-01-00%3A00/f.parquet",
+			bucket: "bucket",
+			key:    "wh/t/data/ts_hour=2024-01-01-00%3A00/f.parquet",
+		},
+		{
+			name:   "bare percent in key",
+			in:     "s3://bucket/dir/100%/f.parquet",
+			bucket: "bucket",
+			key:    "dir/100%/f.parquet",
+		},
+		{
 			name:    "missing key",
 			in:      "s3://bucket/",
 			wantErr: true,

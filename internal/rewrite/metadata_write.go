@@ -94,6 +94,19 @@ func ApplyMetadataJSONMapping(doc map[string]any, mapping PrefixMapping) ([]Path
 					}
 				}
 			}
+			// snapshot.summary: spec-defined keys are counters and carry
+			// no paths, but custom keys can hold anything. Be
+			// conservative — rewrite only values that begin with the
+			// source prefix (the strict prefix rule keeps user data
+			// safe), and only report those as hits to keep the audit
+			// log quiet.
+			if summary, ok := m["summary"].(map[string]any); ok {
+				for k, v := range summary {
+					if s, ok := v.(string); ok && mapping.Matches(s) {
+						summary[k] = mutString(fmt.Sprintf("snapshots[%d].summary[%q]", i, k), s)
+					}
+				}
+			}
 		}
 	}
 

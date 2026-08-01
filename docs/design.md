@@ -45,13 +45,13 @@ Drawn from the Iceberg [table spec](https://iceberg.apache.org/spec/) and
 
 ### Manifest — Avro
 
-| Field                                                                                  | Path?                                                                                      |
-|----------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------|
-| `data_file.file_path` (id 100)                                                         | YES                                                                                        |
-| `data_file.referenced_data_file` (id 143, V2+ for delete files, V3 mandatory for DVs)  | YES                                                                                        |
-| `data_file.lower_bounds` / `upper_bounds` (ids 125/128)                                | NO, even if a data column literally holds bucket strings — bounds describe data, not paths |
-| `data_file.file_size_in_bytes` (id 104)                                                | NO — describes the data file, which we copied byte-perfect                                 |
-| `data_file.content_offset`, `content_size_in_bytes` (V3 DV)                            | NO — offsets inside the Puffin, unaffected by metadata-only rewrites                       |
+| Field                                                                                  | Path?                                                                                                                                                                                                                                                                        |
+|----------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `data_file.file_path` (id 100)                                                         | YES                                                                                                                                                                                                                                                                          |
+| `data_file.referenced_data_file` (id 143, V2+ for delete files, V3 mandatory for DVs)  | YES                                                                                                                                                                                                                                                                          |
+| `data_file.lower_bounds` / `upper_bounds` (ids 125/128)                                | NO for data and equality-delete entries, even if a data column literally holds bucket strings — bounds describe data, not paths. **YES for position-delete entries, field id 2147483546 only**: those bounds hold absolute data-file URIs and engines match delete files by them |
+| `data_file.file_size_in_bytes` (id 104)                                                | NO for byte-copied files. **YES for position-delete entries**: the body re-encode can change the byte length, and readers open the file at the declared length. `split_offsets` / `column_sizes` describe the old layout and are cleared on those entries                        |
+| `data_file.content_offset`, `content_size_in_bytes` (V3 DV)                            | NO — offsets inside the Puffin, unaffected by metadata-only rewrites                                                                                                                                                                                                         |
 
 ### Position delete files (V2)
 
@@ -76,8 +76,9 @@ paths unless they include a deletion-vector blob (rare for stats files).
 - Parquet / ORC data file footers — Iceberg writers don't stamp a self-URI.
 - Avro OCF header schema JSON — describes columns, not locations.
 - `snapshot.summary` map — counters and stats, no paths in spec-defined
-  keys. Custom keys are possible — be conservative: rewrite values that
-  begin with the source prefix.
+  keys. Custom keys are possible — the rewriter is conservative and
+  rewrites any summary value that begins with the source prefix
+  (strict prefix substitution; everything else passes through).
 
 ## Design decisions
 
@@ -194,8 +195,11 @@ For each table in scope:
   2. Walk the metadata graph:
      a. For each snapshot:
           For each manifest_list entry:
-            Read manifest. Detect unsupported features (V2 pos-deletes /
-            V3 DVs); error or skip per --keep-going.
+            Read manifest. Detect unsupported features (V3 DVs); error
+            or skip per --keep-going.
+            For V2 position-delete entries: rewrite the Parquet body's
+            file_path column, the entry's file_path-column bounds, and
+            file_size_in_bytes.
             Mutate data_file.file_path and referenced_data_file.
             Write manifest at substitutePrefix(originalURI, src, dst).
             Capture newManifestLength.
@@ -275,5 +279,8 @@ or a one-off shell session.
 7. **Partial failure**. Deterministic-key idempotency makes re-running
    safe: a second run with the same prefix mapping is a no-op for
    already-rewritten files and a redo for the rest.
-8. **Position-delete files (V2)** and **deletion vectors (V3)** — refused
-   with a clear error in v1; tracked in [`roadmap.md`](./roadmap.md).
+8. **Position-delete files (V2)** — rewritten since v1.0: the Parquet
+   body's `file_path` column, the manifest entry's file_path-column
+   bounds, and `file_size_in_bytes` are all rebased together.
+   **Deletion vectors (V3, Puffin)** remain refused with a clear error;
+   tracked in [`roadmap.md`](./roadmap.md) and [`puffin.md`](./puffin.md).

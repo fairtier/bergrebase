@@ -92,8 +92,15 @@ failures rather than aborting the run), `--current-snapshot-only` (skip
 historical snapshots — faster, but breaks time travel), `--no-validate`
 (skip the post-migration check), `--source-path-style` /
 `--target-path-style` (for MinIO and other servers that need path-style
-addressing), and matching `--source-endpoint` / `--source-region` for
+addressing), `--max-object-size` (raise the per-object read cap —
+default 256 MiB — for very large metadata.json or position-delete
+files), and matching `--source-endpoint` / `--source-region` for
 source-side overrides.
+
+Both prefixes must end with `/` and must not be nested one under the
+other — a slash-less prefix would also match sibling paths
+(`s3://b/warehouse` matches `s3://b/warehouse2/…`), and a nested pair
+breaks idempotent re-runs.
 
 Credentials for object storage are read from environment variables, with
 `SOURCE_*` and `TARGET_*` prefixes:

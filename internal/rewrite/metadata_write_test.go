@@ -16,7 +16,7 @@ const writeFixtureMetadataJSON = `{
 		{
 			"snapshot-id": 7,
 			"manifest-list": "s3://old/iceberg/db/orders/metadata/snap-7-1-abc.avro",
-			"summary": {"operation": "append", "added-records": "10"}
+			"summary": {"operation": "append", "added-records": "10", "custom-staging-dir": "s3://old/iceberg/db/orders/staging"}
 		}
 	],
 	"metadata-log": [
@@ -74,6 +74,15 @@ func TestRewriteMetadataJSON_RewritesAllPathFields(t *testing.T) {
 	}
 	if got := doc["properties"].(map[string]any)["write.object-storage.path"].(string); got != "s3://new/iceberg/db/orders/data" {
 		t.Errorf("write.object-storage.path = %q", got)
+	}
+	// Snapshot summary: custom values starting with the source prefix
+	// are rewritten; spec-defined counters pass through untouched.
+	summary := doc["snapshots"].([]any)[0].(map[string]any)["summary"].(map[string]any)
+	if got := summary["custom-staging-dir"].(string); got != "s3://new/iceberg/db/orders/staging" {
+		t.Errorf("summary custom path value = %q", got)
+	}
+	if got := summary["added-records"].(string); got != "10" {
+		t.Errorf("summary counter mutated: %q", got)
 	}
 	// Untouched non-path fields preserved.
 	if got := doc["properties"].(map[string]any)["owner"].(string); got != "alice" {

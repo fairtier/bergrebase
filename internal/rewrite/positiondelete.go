@@ -16,10 +16,27 @@ import (
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 )
 
+// PositionDeleteRewrite reports what RewritePositionDeleteFile did.
+type PositionDeleteRewrite struct {
+	// NewURI is the delete file's URI after prefix substitution.
+	NewURI string
+	// NewSize is the byte length of the file now at NewURI, or -1 when
+	// the file was out of scope (URI does not begin with mapping.Source)
+	// and was left untouched. Callers must propagate a non-negative
+	// NewSize into the manifest entry's file_size_in_bytes: the rewrite
+	// re-encodes the Parquet body, so the size can differ from the
+	// original (e.g. compressed input, different prefix lengths).
+	NewSize int64
+	// Rewritten is true when the body was re-encoded and PUT. False for
+	// out-of-scope files and for already-rewritten files (no-op re-run).
+	Rewritten bool
+}
+
 // RewritePositionDeleteFile reads the V2 position-delete Parquet at
 // sourceURI from src, rewrites every row's file_path column value via
 // mapping (strict prefix substitution), writes the result at the
-// substituted URI to dst, and returns the new URI.
+// substituted URI to dst, and returns the new URI plus the byte length
+// of the file at that URI.
 //
 // Position-delete files have schema (file_path: string, pos: long) plus
 // an optional `row` column (passed through unchanged). The file_path
@@ -29,10 +46,12 @@ import (
 // get fixed.
 //
 // Idempotency: if sourceURI doesn't begin with mapping.Source, the
-// function returns sourceURI unchanged and writes nothing — same
-// convention as RewriteTable. Re-runs against an already-rewritten
-// file under the source path are no-ops because every row already
-// matches the target prefix.
+// function returns sourceURI unchanged (NewSize=-1) and writes nothing
+// — same convention as RewriteTable. Re-runs against an already-
+// rewritten file under the source path are no-ops because every row
+// already matches the target prefix; NewSize then reports the length
+// of the previously rewritten bytes so the caller can still correct a
+// manifest entry left stale by an interrupted earlier run.
 //
 // Foreign-prefix safety: if a file_path column value is non-empty and
 // matches neither the source nor the target prefix, the function
@@ -40,42 +59,23 @@ import (
 // pointing at a bucket bergrebase wasn't told about is a real
 // configuration error we surface rather than silently miss; the user
 // confirmed full-successful migration is the requirement.
-func RewritePositionDeleteFile(ctx context.Context, src, dst Storage, sourceURI string, mapping PrefixMapping) (string, error) {
+func RewritePositionDeleteFile(ctx context.Context, src, dst Storage, sourceURI string, mapping PrefixMapping) (PositionDeleteRewrite, error) {
 	if !mapping.Matches(sourceURI) {
-		return sourceURI, nil
+		return PositionDeleteRewrite{NewURI: sourceURI, NewSize: -1}, nil
 	}
 
 	raw, err := src.GetObject(ctx, sourceURI)
 	if err != nil {
-		return "", fmt.Errorf("read position-delete %s: %w", sourceURI, err)
+		return PositionDeleteRewrite{}, fmt.Errorf("read position-delete %s: %w", sourceURI, err)
 	}
 
-	pqf, err := file.NewParquetReader(bytes.NewReader(raw))
+	tbl, fpIdx, err := openPositionDelete(ctx, raw, sourceURI)
 	if err != nil {
-		return "", fmt.Errorf("open position-delete parquet %s: %w", sourceURI, err)
-	}
-	defer func() { _ = pqf.Close() }()
-
-	mem := memory.DefaultAllocator
-	rdr, err := pqarrow.NewFileReader(pqf, pqarrow.ArrowReadProperties{}, mem)
-	if err != nil {
-		return "", fmt.Errorf("pqarrow reader %s: %w", sourceURI, err)
-	}
-	tbl, err := rdr.ReadTable(ctx)
-	if err != nil {
-		return "", fmt.Errorf("ReadTable %s: %w", sourceURI, err)
+		return PositionDeleteRewrite{}, err
 	}
 	defer tbl.Release()
-
 	schema := tbl.Schema()
-	idxs := schema.FieldIndices("file_path")
-	if len(idxs) == 0 {
-		return "", fmt.Errorf("position-delete %s lacks file_path column (schema=%s)", sourceURI, schema)
-	}
-	if len(idxs) > 1 {
-		return "", fmt.Errorf("position-delete %s has %d file_path columns, expected 1", sourceURI, len(idxs))
-	}
-	fpIdx := idxs[0]
+	mem := memory.DefaultAllocator
 
 	cols := make([]arrow.Array, schema.NumFields())
 	defer func() {
@@ -91,18 +91,18 @@ func RewritePositionDeleteFile(ctx context.Context, src, dst Storage, sourceURI 
 		col := tbl.Column(i)
 		concat, err := concatChunks(col.Data().Chunks(), mem)
 		if err != nil {
-			return "", fmt.Errorf("concat column %s: %w", schema.Field(i).Name, err)
+			return PositionDeleteRewrite{}, fmt.Errorf("concat column %s: %w", schema.Field(i).Name, err)
 		}
 		if i == fpIdx {
 			strCol, ok := concat.(*array.String)
 			if !ok {
 				concat.Release()
-				return "", fmt.Errorf("position-delete %s: file_path column is %T, expected *array.String", sourceURI, concat)
+				return PositionDeleteRewrite{}, fmt.Errorf("position-delete %s: file_path column is %T, expected *array.String", sourceURI, concat)
 			}
 			rewritten, changed, err := rewriteFilePathColumn(strCol, mapping, mem, sourceURI)
 			concat.Release()
 			if err != nil {
-				return "", err
+				return PositionDeleteRewrite{}, err
 			}
 			cols[i] = rewritten
 			mutated = mutated || changed
@@ -113,8 +113,10 @@ func RewritePositionDeleteFile(ctx context.Context, src, dst Storage, sourceURI 
 
 	if !mutated {
 		// Idempotent: every file_path already targets the new bucket.
-		// Skip the write so a second run produces zero PUTs.
-		return mapping.Apply(sourceURI), nil
+		// Skip the write so a second run produces zero PUTs. The bytes we
+		// just read are the previously rewritten file, so len(raw) is the
+		// size at the substituted URI.
+		return PositionDeleteRewrite{NewURI: mapping.Apply(sourceURI), NewSize: int64(len(raw))}, nil
 	}
 
 	rec := array.NewRecordBatch(schema, cols, tbl.NumRows())
@@ -123,12 +125,78 @@ func RewritePositionDeleteFile(ctx context.Context, src, dst Storage, sourceURI 
 	newURI := mapping.Apply(sourceURI)
 	rewrittenBytes, err := encodePositionDeleteParquet(schema, rec)
 	if err != nil {
-		return "", fmt.Errorf("encode position-delete %s -> %s: %w", sourceURI, newURI, err)
+		return PositionDeleteRewrite{}, fmt.Errorf("encode position-delete %s -> %s: %w", sourceURI, newURI, err)
 	}
 	if err := putAndVerify(ctx, dst, newURI, rewrittenBytes); err != nil {
-		return "", fmt.Errorf("position-delete %s: %w", newURI, err)
+		return PositionDeleteRewrite{}, fmt.Errorf("position-delete %s: %w", newURI, err)
 	}
-	return newURI, nil
+	return PositionDeleteRewrite{NewURI: newURI, NewSize: int64(len(rewrittenBytes)), Rewritten: true}, nil
+}
+
+// WalkPositionDeleteFile is the dry-run counterpart of
+// RewritePositionDeleteFile: it reads the delete file's Parquet body and
+// runs the same file_path column checks (parseability, single file_path
+// column, no foreign-prefix rows) without writing anything. This keeps a
+// clean dry-run predictive of the live run — a body that would fail the
+// live rewrite fails the dry-run walk with the same error.
+func WalkPositionDeleteFile(ctx context.Context, src Storage, sourceURI string, mapping PrefixMapping) error {
+	if !mapping.Matches(sourceURI) {
+		return nil
+	}
+	raw, err := src.GetObject(ctx, sourceURI)
+	if err != nil {
+		return fmt.Errorf("read position-delete %s: %w", sourceURI, err)
+	}
+	tbl, fpIdx, err := openPositionDelete(ctx, raw, sourceURI)
+	if err != nil {
+		return err
+	}
+	defer tbl.Release()
+
+	for _, chunk := range tbl.Column(fpIdx).Data().Chunks() {
+		strCol, ok := chunk.(*array.String)
+		if !ok {
+			return fmt.Errorf("position-delete %s: file_path column is %T, expected *array.String", sourceURI, chunk)
+		}
+		rewritten, _, err := rewriteFilePathColumn(strCol, mapping, memory.DefaultAllocator, sourceURI)
+		if err != nil {
+			return err
+		}
+		rewritten.Release()
+	}
+	return nil
+}
+
+// openPositionDelete parses raw as Parquet, materialises it as an Arrow
+// table, and locates the single file_path column. The caller must
+// Release the returned table.
+func openPositionDelete(ctx context.Context, raw []byte, sourceURI string) (arrow.Table, int, error) {
+	pqf, err := file.NewParquetReader(bytes.NewReader(raw))
+	if err != nil {
+		return nil, 0, fmt.Errorf("open position-delete parquet %s: %w", sourceURI, err)
+	}
+	defer func() { _ = pqf.Close() }()
+
+	rdr, err := pqarrow.NewFileReader(pqf, pqarrow.ArrowReadProperties{}, memory.DefaultAllocator)
+	if err != nil {
+		return nil, 0, fmt.Errorf("pqarrow reader %s: %w", sourceURI, err)
+	}
+	tbl, err := rdr.ReadTable(ctx)
+	if err != nil {
+		return nil, 0, fmt.Errorf("ReadTable %s: %w", sourceURI, err)
+	}
+
+	schema := tbl.Schema()
+	idxs := schema.FieldIndices("file_path")
+	if len(idxs) == 0 {
+		tbl.Release()
+		return nil, 0, fmt.Errorf("position-delete %s lacks file_path column (schema=%s)", sourceURI, schema)
+	}
+	if len(idxs) > 1 {
+		tbl.Release()
+		return nil, 0, fmt.Errorf("position-delete %s has %d file_path columns, expected 1", sourceURI, len(idxs))
+	}
+	return tbl, idxs[0], nil
 }
 
 // concatChunks returns a single Array spanning every chunk of a
