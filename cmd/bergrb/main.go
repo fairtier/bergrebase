@@ -321,7 +321,8 @@ func sideCredentials(side string) (awsCredentials, error) {
 	if (creds.accessKeyID == "") != (creds.secretAccessKey == "") {
 		return awsCredentials{}, fmt.Errorf(
 			"%s_AWS_ACCESS_KEY_ID and %s_AWS_SECRET_ACCESS_KEY must be set together (exactly one is set — typo in the variable name?)",
-			side, side)
+			side, side,
+		)
 	}
 	if creds.accessKeyID == "" {
 		slog.Warn("no static credentials in env; using the AWS SDK default chain (env AWS_*, shared config, IMDS)",
