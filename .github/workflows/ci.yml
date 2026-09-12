@@ -22,6 +22,17 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
         with:
+          # Pinned rather than floating on latest, which is what every sibling
+          # repo already did and this one did not — so this is the repo that
+          # proved the point. On 2026-09-12 `latest` moved 2.13.1 → 2.13.2, a
+          # newer gofumpt flagged cmd/bergrb/main.go untouched since August,
+          # and CI went red with nothing having been committed to it.
+          #
+          # It is also a hard floor, not a preference: golangci-lint refuses to
+          # run when the Go it was built with is below the module's `go`
+          # directive, and reports that refusal as "0 issues" — a false green,
+          # which is the worse failure. Bump this with go.mod.
+          version: v2.13.2
           args: --timeout=5m
 
   test:
