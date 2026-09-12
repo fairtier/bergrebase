@@ -23,13 +23,21 @@ import (
 	bergstorage "github.com/fairtier/bergrebase/internal/storage"
 )
 
-// defaultMinioImage is the testcontainers-go module default. MinIO has
-// a track record of removing older RELEASE tags from Docker Hub
-// without notice; if this image disappears, override via the
-// BERGREBASE_TEST_MINIO_IMAGE env var. Any S3-compatible MinIO build
-// (e.g., quay.io/minio/minio:<tag>, bitnami/minio) works for our tests
-// — we only exercise GetObject / PutObject / HeadObject / CreateBucket.
-const defaultMinioImage = "minio/minio:RELEASE.2024-01-16T16-07-38Z"
+// defaultMinioImage was the testcontainers-go module default on Docker
+// Hub until 2026-09, when the prediction below came true: `minio/minio`
+// now answers an anonymous pull scope with 401 (not 429 — this is a
+// restriction, not throttling), while library/alpine on the same probe
+// still answers 200. CI went red on 2026-09-12 with "pull access denied
+// for minio/minio" in every testcontainers e2e test.
+//
+// quay.io carries the SAME tag, so this is a registry change and not a
+// version change — the binary under test is byte-identical, and
+// defaultLakekeeperImage below was already pointing there.
+//
+// Override still works via BERGREBASE_TEST_MINIO_IMAGE. Any
+// S3-compatible MinIO build works for our tests — we only exercise
+// GetObject / PutObject / HeadObject / CreateBucket.
+const defaultMinioImage = "quay.io/minio/minio:RELEASE.2024-01-16T16-07-38Z"
 
 // MinIO holds a running MinIO testcontainer plus the connection details
 // the e2e tests need.
