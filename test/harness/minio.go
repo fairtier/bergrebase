@@ -37,6 +37,21 @@ import (
 // Override still works via BERGREBASE_TEST_MINIO_IMAGE. Any
 // S3-compatible MinIO build works for our tests — we only exercise
 // GetObject / PutObject / HeadObject / CreateBucket.
+//
+// If quay.io ever follows Docker Hub, the ladder, checked 2026-09-13:
+//
+//  1. ghcr.io/coollabsio/minio — a third party that builds from source
+//     because MinIO stopped publishing new releases. Carries only 9 tags
+//     (2025-04 → 2025-10) and NOT the tag above, so it costs a version
+//     bump, not just a registry swap; unlicensed, and nothing published
+//     since 2025-10. A fallback, not a peer of quay.io.
+//  2. Build from source ourselves — minio/minio Dockerfile.release, or
+//     `go install github.com/minio/minio@latest` in a golang image.
+//     Most work, fewest third parties.
+//
+// NOT bitnami/minio, which the older version of this comment suggested:
+// Broadcom's 2025-08 rug-pull emptied it (the repo resolves but lists
+// ZERO tags) and moved the archive to bitnamilegacy/, unmaintained.
 const defaultMinioImage = "quay.io/minio/minio:RELEASE.2024-01-16T16-07-38Z"
 
 // MinIO holds a running MinIO testcontainer plus the connection details
