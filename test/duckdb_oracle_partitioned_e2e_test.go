@@ -53,7 +53,7 @@ func TestDuckDBOracle_Partitioned(t *testing.T) {
 		iceberg.NestedField{ID: 2, Name: "day", Type: iceberg.PrimitiveTypes.String, Required: true},
 	)
 	spec := iceberg.NewPartitionSpec(iceberg.PartitionField{
-		SourceID:  2,
+		SourceIDs: []int{2},
 		FieldID:   1000,
 		Name:      "day",
 		Transform: iceberg.IdentityTransform{},
