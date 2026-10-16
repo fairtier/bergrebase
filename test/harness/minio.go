@@ -23,36 +23,27 @@ import (
 	bergstorage "github.com/fairtier/bergrebase/internal/storage"
 )
 
-// defaultMinioImage was the testcontainers-go module default on Docker
-// Hub until 2026-09, when the prediction below came true: `minio/minio`
-// now answers an anonymous pull scope with 401 (not 429 — this is a
-// restriction, not throttling), while library/alpine on the same probe
-// still answers 200. CI went red on 2026-09-12 with "pull access denied
-// for minio/minio" in every testcontainers e2e test.
+// defaultMinioImage is Silo, the community continuation of the MinIO
+// server on its last Apache-2.0 lineage. It runs through the testcontainers
+// MinIO module unchanged: its entrypoint maps the module's `server /data`
+// onto `silo`, and it answers the same S3 API on :9000. duckflight's
+// Iceberg suite runs the same tag.
 //
-// quay.io carries the SAME tag, so this is a registry change and not a
-// version change — the binary under test is byte-identical, and
-// defaultLakekeeperImage below was already pointing there.
+// Not MinIO itself. `minio/minio` on Docker Hub started answering anonymous
+// pulls with 401 in 2026-09 (CI went red on 2026-09-12), and this moved to
+// `quay.io/minio/minio:RELEASE.2024-01-16T16-07-38Z`. quay.io followed in
+// 2026-10 with "unauthorized: access to the requested resource is not
+// authorized", failing every testcontainers e2e test again.
 //
-// Override still works via BERGREBASE_TEST_MINIO_IMAGE. Any
-// S3-compatible MinIO build works for our tests — we only exercise
+// Pinned, because an unpinned tag is how a test starts failing without
+// anything in this repo changing. Override via BERGREBASE_TEST_MINIO_IMAGE.
+// Any S3-compatible MinIO build works for our tests — we only exercise
 // GetObject / PutObject / HeadObject / CreateBucket.
 //
-// If quay.io ever follows Docker Hub, the ladder, checked 2026-09-13:
-//
-//  1. ghcr.io/coollabsio/minio — a third party that builds from source
-//     because MinIO stopped publishing new releases. Carries only 9 tags
-//     (2025-04 → 2025-10) and NOT the tag above, so it costs a version
-//     bump, not just a registry swap; unlicensed, and nothing published
-//     since 2025-10. A fallback, not a peer of quay.io.
-//  2. Build from source ourselves — minio/minio Dockerfile.release, or
-//     `go install github.com/minio/minio@latest` in a golang image.
-//     Most work, fewest third parties.
-//
-// NOT bitnami/minio, which the older version of this comment suggested:
-// Broadcom's 2025-08 rug-pull emptied it (the repo resolves but lists
-// ZERO tags) and moved the archive to bitnamilegacy/, unmaintained.
-const defaultMinioImage = "quay.io/minio/minio:RELEASE.2024-01-16T16-07-38Z"
+// NOT bitnami/minio: Broadcom's 2025-08 rug-pull emptied it (the repo
+// resolves but lists ZERO tags) and moved the archive to bitnamilegacy/,
+// unmaintained.
+const defaultMinioImage = "docker.io/pgsty/silo:RELEASE.2026-09-03T13-18-01Z"
 
 // MinIO holds a running MinIO testcontainer plus the connection details
 // the e2e tests need.
