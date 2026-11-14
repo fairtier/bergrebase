@@ -11,8 +11,6 @@ import (
 	"strconv"
 
 	iceberg "github.com/apache/iceberg-go"
-	"github.com/hamba/avro/v2"
-	"github.com/hamba/avro/v2/ocf"
 )
 
 // RewriteManifest reads the Avro manifest pointed to by mf, applies
@@ -308,12 +306,10 @@ type parsedManifestHeader struct {
 // the header key wins when both are present. format-version is optional only on
 // V1 manifests, so an absent key means V1.
 func manifestHeader(raw []byte) (parsedManifestHeader, error) {
-	dec, err := ocf.NewDecoder(bytes.NewReader(raw), ocf.WithDecoderSchemaCache(&avro.SchemaCache{}))
+	meta, err := readOCFMetadata(raw)
 	if err != nil {
 		return parsedManifestHeader{}, err
 	}
-	defer func() { _ = dec.Close() }()
-	meta := dec.Metadata()
 	schema := &iceberg.Schema{}
 	if err := json.Unmarshal(meta["schema"], schema); err != nil {
 		return parsedManifestHeader{}, fmt.Errorf("'schema' metadata is invalid: %w", err)

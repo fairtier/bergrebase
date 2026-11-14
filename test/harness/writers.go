@@ -21,8 +21,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/hamba/avro/v2"
-	"github.com/hamba/avro/v2/ocf"
+	"github.com/twmb/avro/ocf"
 )
 
 //go:embed pyiceberg_driver.py
@@ -470,10 +469,10 @@ func (m *MinIO) ListKeys(ctx context.Context, t *testing.T, bucket, prefix strin
 // OCFMetadata returns the key/value header of an Avro object container file.
 func OCFMetadata(t *testing.T, raw []byte) map[string][]byte {
 	t.Helper()
-	dec, err := ocf.NewDecoder(bytes.NewReader(raw), ocf.WithDecoderSchemaCache(&avro.SchemaCache{}))
+	rd, err := ocf.NewReader(bytes.NewReader(raw))
 	if err != nil {
 		t.Fatalf("decode OCF header: %v", err)
 	}
-	defer func() { _ = dec.Close() }()
-	return dec.Metadata()
+	defer func() { _ = rd.Close() }()
+	return rd.Metadata()
 }
