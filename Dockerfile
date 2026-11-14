@@ -1,7 +1,12 @@
 ############################
 # STEP 0 build arguments
 ############################
-ARG GO_VERSION=1.26
+# Go 1.26.11 — the first 1.26 patch release with the net/http fix for
+# GO-2026-6859 (MaxBytesReader header race). Matches the `toolchain go1.26.11`
+# in go.mod — move the two together (CI resolves its toolchain from go.mod;
+# this pin is the only hand-maintained copy). The `go 1.26.0` directive stays
+# the minimum language version.
+ARG GO_VERSION=1.26.11
 ARG BASE_VARIANT=trixie
 
 ############################
