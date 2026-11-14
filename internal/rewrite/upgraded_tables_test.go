@@ -4,13 +4,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"strconv"
 	"strings"
 	"testing"
 
 	iceberg "github.com/apache/iceberg-go"
-	"github.com/hamba/avro/v2"
-	"github.com/hamba/avro/v2/ocf"
+	"github.com/twmb/avro/ocf"
 )
 
 var testMapping = PrefixMapping{Source: "s3://old/", Target: "s3://new/"}
@@ -74,32 +74,34 @@ func writeTestManifest(t *testing.T, version int, uri string, snapshotID int64, 
 func setEntrySnapshot(t *testing.T, raw []byte, snapshotID int64) []byte {
 	t.Helper()
 	return editEntries(t, raw, func(row map[string]any) {
-		row["snapshot_id"] = map[string]any{"long": snapshotID}
+		row["snapshot_id"] = snapshotID
 	})
 }
 
 // editEntries re-encodes a manifest with edit applied to each raw entry.
 func editEntries(t *testing.T, raw []byte, edit func(map[string]any)) []byte {
 	t.Helper()
-	dec, err := ocf.NewDecoder(bytes.NewReader(raw), ocf.WithDecoderSchemaCache(&avro.SchemaCache{}))
+	rd, err := ocf.NewReader(bytes.NewReader(raw))
 	if err != nil {
 		t.Fatal(err)
 	}
-	meta := dec.Metadata()
+	defer func() { _ = rd.Close() }()
 	extra := map[string][]byte{}
-	for k, v := range meta {
+	for k, v := range rd.Metadata() {
 		if !strings.HasPrefix(k, "avro.") {
 			extra[k] = v
 		}
 	}
 	var out bytes.Buffer
-	enc, err := ocf.NewEncoder(string(meta["avro.schema"]), &out, ocf.WithMetadata(extra), ocf.WithEncoderSchemaCache(&avro.SchemaCache{}))
+	enc, err := ocf.NewWriter(&out, rd.Schema(), ocf.WithMetadata(extra))
 	if err != nil {
 		t.Fatal(err)
 	}
-	for dec.HasNext() {
+	for {
 		var row map[string]any
-		if err := dec.Decode(&row); err != nil {
+		if err := rd.Decode(&row); errors.Is(err, io.EOF) {
+			break
+		} else if err != nil {
 			t.Fatal(err)
 		}
 		edit(row)
