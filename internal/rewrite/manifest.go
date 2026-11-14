@@ -7,8 +7,7 @@ import (
 	"strconv"
 
 	iceberg "github.com/apache/iceberg-go"
-	"github.com/hamba/avro/v2"
-	"github.com/hamba/avro/v2/ocf"
+	"github.com/twmb/avro/ocf"
 )
 
 // WalkManifestList reads the Avro manifest list at uri from src, returns
@@ -46,19 +45,42 @@ func WalkManifestList(ctx context.Context, src Storage, uri string, mapping Pref
 // readManifestListHeader extracts the OCF-level metadata that the
 // manifest-list writer requires when re-emitting the list. iceberg-go's
 // ManifestListReader does not expose these values, so we open the OCF
-// container ourselves with hamba/avro/v2 (already a transitive dep).
+// container ourselves with twmb/avro's ocf reader — the same reader
+// iceberg.ReadManifestList runs over these bytes a moment later, so this
+// adds no second Avro decoder to the input path. Its header parse is
+// bounded: every metadata map block count and key/value length is
+// capped (1 MiB; 64 MiB for avro.schema) before anything is allocated.
+// hamba/avro/v2, used here before, decodes that map without bounds
+// (GO-2026-5046/5047/5048, unmaintained, no fixed release).
+//
+// Only the header is read; no data block is decoded.
 //
 // V1 stores no sequence-number; V3 additionally stores first-row-id.
 // Missing fields return zero values; the writer picks the right
 // constructor based on the format version returned here.
 func readManifestListHeader(raw []byte) (ManifestListHeader, int, error) {
-	dec, err := ocf.NewDecoder(bytes.NewReader(raw), ocf.WithDecoderSchemaCache(&avro.SchemaCache{}))
+	meta, err := readOCFMetadata(raw)
 	if err != nil {
 		return ManifestListHeader{}, 0, err
 	}
-	defer func() { _ = dec.Close() }()
+	return parseManifestListHeader(meta)
+}
 
-	meta := dec.Metadata()
+// readOCFMetadata returns the key-value metadata of the Avro OCF header
+// in raw. It parses the header only (magic, metadata map, embedded
+// schema, sync marker) and never touches a data block.
+func readOCFMetadata(raw []byte) (map[string][]byte, error) {
+	rd, err := ocf.NewReader(bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rd.Close() }()
+	return rd.Metadata(), nil
+}
+
+// parseManifestListHeader maps a manifest list's OCF metadata onto
+// ManifestListHeader and the table format version.
+func parseManifestListHeader(meta map[string][]byte) (ManifestListHeader, int, error) {
 	version, err := strconv.Atoi(string(meta["format-version"]))
 	if err != nil {
 		return ManifestListHeader{}, 0, fmt.Errorf("manifest-list format-version: %w", err)
