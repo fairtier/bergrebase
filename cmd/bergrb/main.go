@@ -471,8 +471,8 @@ func migrateOne(ctx context.Context, cat catalog.Catalog, engine *rewrite.Engine
 // validateAfterSwap performs the catalog-side and storage-side halves
 // of the post-rebase validation: the catalog resolves expectedLoc, and
 // every live data/delete file of the current snapshot exists on target
-// with no metadata URI left under the source prefix. It checks presence,
-// not content.
+// at its declared size, with no metadata URI or position-delete row left
+// under the source prefix. Data-file contents are not read.
 func validateAfterSwap(ctx context.Context, cat catalog.Catalog, target rewrite.Storage, mapping rewrite.PrefixMapping, id catalog.Identifier, expectedLoc string, expectedSnap *int64) error {
 	reloaded, err := cat.LoadTable(ctx, id)
 	if err != nil {

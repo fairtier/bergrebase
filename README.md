@@ -174,7 +174,8 @@ that *isn't* a path.
    catalog pointer back to the old metadata location so reads keep working.
 8. **Validate.** `LoadTable` post-swap, confirm the snapshot ID matches,
    `HEAD` every live data and delete file of the current snapshot on the
-   target, and refuse if any metadata, manifest-list or manifest URI reachable
+   target and compare its size with the manifest, read every live
+   position-delete file and refuse if a row still names the source, and refuse if any metadata, manifest-list or manifest URI reachable
    from the new `metadata.json` still names the source prefix (the sign of a
    source re-copied over the rewritten files). `--no-validate` skips this.
 
@@ -198,8 +199,11 @@ that *isn't* a path.
 The post-rebase check confirms the catalog now serves the new
 `metadata.json` (matching snapshot ID), that every live data and delete file
 of the current snapshot exists in the target bucket, and that no metadata URI
-reachable from it still points at the source prefix. It checks presence, not
-content: a truncated object passes. It runs after the swap; see
+reachable from it still points at the source prefix. Each of those files must
+also have the size its manifest declares, and every live position-delete file's
+`file_path` rows must name the target: an original delete file restored over
+the rewritten one would otherwise stop applying, silently bringing deleted
+rows back. Data-file contents are not read. It runs after the swap; see
 [what to do if it fails](./docs/migration-recipes.md#if-validation-fails-after-the-swap). It does **not** re-read
 every data file footer or compare per-column statistics. Full
 correctness verification belongs to your data pipeline (e.g.

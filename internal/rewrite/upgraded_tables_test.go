@@ -22,6 +22,7 @@ type testEntry struct {
 	seq      int64
 	content  iceberg.ManifestEntryContent
 	ref      string
+	size     int64 // file_size_in_bytes; 0 means 100
 }
 
 // writeTestManifest encodes a manifest in the given format version and returns
@@ -36,7 +37,11 @@ func writeTestManifest(t *testing.T, version int, uri string, snapshotID int64, 
 		t.Fatal(err)
 	}
 	for _, e := range entries {
-		b, err := iceberg.NewDataFileBuilder(spec, e.content, e.path, iceberg.ParquetFile, map[int]any{}, nil, nil, 10, 100)
+		size := e.size
+		if size == 0 {
+			size = 100
+		}
+		b, err := iceberg.NewDataFileBuilder(spec, e.content, e.path, iceberg.ParquetFile, map[int]any{}, nil, nil, 10, size)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -407,7 +412,7 @@ func validationFixture(t *testing.T, st *memStorage) string {
 func TestValidateAfterSwap_TombstoneFirst_NoFalseFailure(t *testing.T) {
 	st := newMemStorage()
 	meta := validationFixture(t, st)
-	st.objects["s3://new/t/data/live.parquet"] = []byte("x")
+	st.objects["s3://new/t/data/live.parquet"] = make([]byte, 100)
 	if err := ValidateAfterSwap(context.Background(), st, meta, testMapping); err != nil {
 		t.Errorf("tombstone's file is legitimately gone, live file present: %v", err)
 	}

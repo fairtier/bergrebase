@@ -30,7 +30,7 @@ func TestValidateAfterSwap_HappyPath(t *testing.T) {
 
 	mf, manRaw := buildV2Manifest(t, manifestURI, dataURI, snapID)
 	store.objects[manifestURI] = manRaw
-	store.objects[dataURI] = []byte("placeholder")
+	store.objects[dataURI] = make([]byte, 1024) // buildV2Manifest's declared size
 
 	listBuf := &bytes.Buffer{}
 	seq := int64(1)
@@ -151,7 +151,7 @@ func TestPickValidationSnapshot_FallbackToLast(t *testing.T) {
 // tombstone) and one delete manifest with a live position-delete file. It
 // returns the metadata URI and every live file URI. The live files are not
 // seeded; callers decide which exist.
-func fullTableFixture(t *testing.T, st *memStorage, rewriteMeta func(string) string) (string, []string) {
+func fullTableFixture(t *testing.T, st *memStorage, rewriteMeta func(string) string) (string, []string, map[string][]byte) {
 	t.Helper()
 	const (
 		dataMan = "s3://new/t/metadata/data.avro"
@@ -165,6 +165,11 @@ func fullTableFixture(t *testing.T, st *memStorage, rewriteMeta func(string) str
 		"s3://new/t/data/c.parquet",
 		"s3://new/t/data/pos-1.parquet",
 	}
+	posBody := encodePosDeleteBody(t, []string{live[0], live[1]})
+	bodies := map[string][]byte{
+		live[0]: make([]byte, 100), live[1]: make([]byte, 100), live[2]: make([]byte, 100),
+		live[3]: posBody,
+	}
 	dmf, draw := writeTestManifest(t, 2, dataMan, 900, iceberg.ManifestContentData, []testEntry{
 		{status: iceberg.EntryStatusADDED, path: live[0], snapshot: 900, seq: 1, content: iceberg.EntryContentData},
 		{status: iceberg.EntryStatusDELETED, path: "s3://new/t/data/gone.parquet", snapshot: 900, seq: 1, content: iceberg.EntryContentData},
@@ -172,7 +177,7 @@ func fullTableFixture(t *testing.T, st *memStorage, rewriteMeta func(string) str
 		{status: iceberg.EntryStatusADDED, path: live[2], snapshot: 900, seq: 1, content: iceberg.EntryContentData},
 	})
 	xmf, xraw := writeTestManifest(t, 2, delMan, 900, iceberg.ManifestContentDeletes, []testEntry{
-		{status: iceberg.EntryStatusADDED, path: live[3], snapshot: 900, seq: 1, content: iceberg.EntryContentPosDeletes},
+		{status: iceberg.EntryStatusADDED, path: live[3], snapshot: 900, seq: 1, content: iceberg.EntryContentPosDeletes, size: int64(len(posBody))},
 	})
 	st.objects[dataMan] = draw
 	st.objects[delMan] = xraw
@@ -189,14 +194,14 @@ func fullTableFixture(t *testing.T, st *memStorage, rewriteMeta func(string) str
 		doc = rewriteMeta(doc)
 	}
 	st.objects[meta] = []byte(doc)
-	return meta, live
+	return meta, live, bodies
 }
 
 func TestValidateAfterSwap_AllLiveFilesPresent(t *testing.T) {
 	st := newMemStorage()
-	meta, live := fullTableFixture(t, st, nil)
+	meta, live, bodies := fullTableFixture(t, st, nil)
 	for _, u := range live {
-		st.objects[u] = []byte("x")
+		st.objects[u] = bodies[u]
 	}
 	if err := ValidateAfterSwap(context.Background(), st, meta, testMapping); err != nil {
 		t.Fatalf("every live file is present: %v", err)
@@ -208,10 +213,10 @@ func TestValidateAfterSwap_AllLiveFilesPresent(t *testing.T) {
 func TestValidateAfterSwap_AnyLiveFileMissing(t *testing.T) {
 	for skip := range 4 {
 		st := newMemStorage()
-		meta, live := fullTableFixture(t, st, nil)
+		meta, live, bodies := fullTableFixture(t, st, nil)
 		for i, u := range live {
 			if i != skip {
-				st.objects[u] = []byte("x")
+				st.objects[u] = bodies[u]
 			}
 		}
 		err := ValidateAfterSwap(context.Background(), st, meta, testMapping)
@@ -238,9 +243,9 @@ func TestValidateAfterSwap_SourceURIsLeft(t *testing.T) {
 		},
 	} {
 		st := newMemStorage()
-		meta, live := fullTableFixture(t, st, edit)
+		meta, live, bodies := fullTableFixture(t, st, edit)
 		for _, u := range live {
-			st.objects[u] = []byte("x")
+			st.objects[u] = bodies[u]
 		}
 		if err := ValidateAfterSwap(context.Background(), st, meta, testMapping); !errors.Is(err, ErrValidationFailed) {
 			t.Errorf("%s under source prefix: err = %v, want ErrValidationFailed", name, err)
@@ -250,16 +255,16 @@ func TestValidateAfterSwap_SourceURIsLeft(t *testing.T) {
 
 func TestValidateAfterSwap_ManifestListPointsAtSource(t *testing.T) {
 	st := newMemStorage()
-	meta, live := fullTableFixture(t, st, nil)
+	meta, live, bodies := fullTableFixture(t, st, nil)
 	for _, u := range live {
-		st.objects[u] = []byte("x")
+		st.objects[u] = bodies[u]
 	}
 	// The original (source) manifest list copied over the rewritten one.
 	mf, raw := writeTestManifest(t, 2, "s3://old/t/metadata/data.avro", 900, iceberg.ManifestContentData, []testEntry{
 		{status: iceberg.EntryStatusADDED, path: "s3://old/t/data/a.parquet", snapshot: 900, seq: 1, content: iceberg.EntryContentData},
 	})
 	st.objects["s3://old/t/metadata/data.avro"] = raw
-	st.objects["s3://old/t/data/a.parquet"] = []byte("x")
+	st.objects["s3://old/t/data/a.parquet"] = make([]byte, 100)
 	seq := int64(1)
 	buf := &bytes.Buffer{}
 	if err := iceberg.WriteManifestList(2, buf, 900, nil, &seq, 0, []iceberg.ManifestFile{mf}); err != nil {
@@ -273,17 +278,50 @@ func TestValidateAfterSwap_ManifestListPointsAtSource(t *testing.T) {
 
 func TestValidateAfterSwap_ManifestPointsAtSource(t *testing.T) {
 	st := newMemStorage()
-	meta, live := fullTableFixture(t, st, nil)
+	meta, live, bodies := fullTableFixture(t, st, nil)
 	for _, u := range live {
-		st.objects[u] = []byte("x")
+		st.objects[u] = bodies[u]
 	}
 	// The original manifest copied over the rewritten one, at the same key.
 	_, raw := writeTestManifest(t, 2, "s3://new/t/metadata/data.avro", 900, iceberg.ManifestContentData, []testEntry{
 		{status: iceberg.EntryStatusADDED, path: "s3://old/t/data/a.parquet", snapshot: 900, seq: 1, content: iceberg.EntryContentData},
 	})
 	st.objects["s3://new/t/metadata/data.avro"] = raw
-	st.objects["s3://old/t/data/a.parquet"] = []byte("x")
+	st.objects["s3://old/t/data/a.parquet"] = make([]byte, 100)
 	if err := ValidateAfterSwap(context.Background(), st, meta, testMapping); !errors.Is(err, ErrValidationFailed) {
 		t.Errorf("manifest references a source data file: err = %v", err)
+	}
+}
+
+// A re-copy of only the source data/ prefix restores the original
+// position-delete files over the rewritten ones. Same key, every manifest
+// still clean, but their rows name the source, so readers stop applying them.
+func TestValidateAfterSwap_PositionDeleteBodyPointsAtSource(t *testing.T) {
+	st := newMemStorage()
+	meta, live, bodies := fullTableFixture(t, st, nil)
+	for _, u := range live {
+		st.objects[u] = bodies[u]
+	}
+	original := encodePosDeleteBody(t, []string{"s3://old/t/data/a.parquet", "s3://old/t/data/b.parquet"})
+	if len(original) != len(bodies[live[3]]) {
+		t.Fatalf("fixture wants equal sizes so only the body check can catch it: %d vs %d", len(original), len(bodies[live[3]]))
+	}
+	st.objects[live[3]] = original
+	err := ValidateAfterSwap(context.Background(), st, meta, testMapping)
+	if !errors.Is(err, ErrValidationFailed) || !strings.Contains(err.Error(), live[3]) {
+		t.Fatalf("restored original delete file: err = %v, want ErrValidationFailed naming %s", err, live[3])
+	}
+}
+
+func TestValidateAfterSwap_SizeMismatch(t *testing.T) {
+	st := newMemStorage()
+	meta, live, bodies := fullTableFixture(t, st, nil)
+	for _, u := range live {
+		st.objects[u] = bodies[u]
+	}
+	st.objects[live[1]] = make([]byte, 60) // truncated copy
+	err := ValidateAfterSwap(context.Background(), st, meta, testMapping)
+	if !errors.Is(err, ErrValidationFailed) || !strings.Contains(err.Error(), "size 60") {
+		t.Fatalf("truncated object: err = %v", err)
 	}
 }

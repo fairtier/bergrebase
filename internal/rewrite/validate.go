@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/apache/arrow-go/v18/arrow/array"
 	iceberg "github.com/apache/iceberg-go"
 )
 
@@ -17,7 +18,7 @@ import (
 // to roll back.
 var ErrValidationFailed = errors.New("post-rewrite validation failed")
 
-// validateHeadConcurrency bounds the parallel HEADs ValidateAfterSwap
+// validateHeadConcurrency bounds the parallel file checks ValidateAfterSwap
 // issues against target storage.
 const validateHeadConcurrency = 16
 
@@ -32,9 +33,14 @@ const validateHeadConcurrency = 16
 //     to the last-listed snapshot for tables without a current pointer).
 //  3. Decode its manifest list and every manifest in it, asserting the
 //     same of each manifest URI and each entry's file path.
-//  4. HEAD every live (not DELETED) data and delete file on target —
-//     assert the bulk byte copy landed all of them. A tombstone says
+//  4. HEAD every live (not DELETED) data and delete file on target and
+//     compare its size with the manifest's file_size_in_bytes — assert
+//     the bulk byte copy landed all of them whole. A tombstone says
 //     nothing about the copy: its file may be legitimately gone.
+//  5. Read every live position-delete file and assert no file_path row
+//     still starts with mapping.Source. Readers match deletes by path, so
+//     an original delete file restored over the rewritten one (a re-copy
+//     of just the data/ prefix) silently stops applying.
 //
 // Step 1 and 3 catch a re-copy of the source onto the target after the
 // rebase: it overwrites the rewritten files, at the same keys, with the
@@ -51,8 +57,9 @@ const validateHeadConcurrency = 16
 // catalog-side check (re-load + compare pointer + snapshot ID) lives in
 // cmd/bergrb because it depends on the Catalog interface.
 //
-// This checks presence, not content: it does not compare sizes, footers
-// or row counts against the manifests.
+// Beyond position-delete bodies this checks presence and size, not
+// content: it does not compare data-file footers, checksums or row counts
+// against the manifests, and does not walk older snapshots' files.
 func ValidateAfterSwap(ctx context.Context, target Storage, newLocation string, mapping PrefixMapping) error {
 	if mapping.Source == "" {
 		return fmt.Errorf("%w: empty source prefix", ErrValidationFailed)
@@ -85,7 +92,7 @@ func ValidateAfterSwap(ctx context.Context, target Storage, newLocation string, 
 	if err != nil {
 		return fmt.Errorf("%w: decode manifest list %s: %w", ErrValidationFailed, snap.ManifestList, err)
 	}
-	var live []string
+	var live []liveFile
 	seen := map[string]bool{}
 	for _, mf := range files {
 		if stale(mapping, mf.FilePath()) {
@@ -112,11 +119,64 @@ func ValidateAfterSwap(ctx context.Context, target Storage, newLocation string, 
 			}
 			if !seen[uri] {
 				seen[uri] = true
-				live = append(live, uri)
+				df := entry.DataFile()
+				live = append(live, liveFile{
+					uri:       uri,
+					size:      df.FileSizeBytes(),
+					posDelete: df.ContentType() == iceberg.EntryContentPosDeletes && df.FileFormat() == iceberg.ParquetFile,
+				})
 			}
 		}
 	}
-	return headAll(ctx, target, live)
+	return checkFiles(ctx, target, live, mapping)
+}
+
+// liveFile is one live data or delete file the current snapshot references.
+type liveFile struct {
+	uri       string
+	size      int64 // file_size_in_bytes from the manifest entry
+	posDelete bool  // a Parquet position-delete file, whose body holds URIs
+}
+
+// checkFile asserts f exists on target at the size its manifest entry
+// declares and, for a position-delete file, that no file_path row still
+// points under the source prefix. A delete file whose rows name the source
+// stops applying once readers resolve data files at the target (they match
+// deletes by path), so its deleted rows silently come back; that is what a
+// re-copy of the source data/ prefix over the rebase does.
+func checkFile(ctx context.Context, target Storage, f liveFile, mapping PrefixMapping) error {
+	size, err := target.HeadObject(ctx, f.uri)
+	if err != nil {
+		return fmt.Errorf("not readable: %w", err)
+	}
+	if size != f.size {
+		return fmt.Errorf("size %d, manifest declares %d (partial or replaced object)", size, f.size)
+	}
+	if !f.posDelete {
+		return nil
+	}
+	raw, err := target.GetObject(ctx, f.uri)
+	if err != nil {
+		return fmt.Errorf("read position-delete body: %w", err)
+	}
+	tbl, fpIdx, err := openPositionDelete(ctx, raw, f.uri)
+	if err != nil {
+		return err
+	}
+	defer tbl.Release()
+	for _, chunk := range tbl.Column(fpIdx).Data().Chunks() {
+		col, ok := chunk.(*array.String)
+		if !ok {
+			return fmt.Errorf("file_path column is %T, expected *array.String", chunk)
+		}
+		for i := range col.Len() {
+			if !col.IsNull(i) && stale(mapping, col.Value(i)) {
+				return fmt.Errorf("file_path row %d names %s under source prefix %q (the original delete file restored over the rewritten one?)",
+					i, col.Value(i), mapping.Source)
+			}
+		}
+	}
+	return nil
 }
 
 // stale reports whether uri still points under the source prefix. A URI
@@ -126,40 +186,36 @@ func stale(m PrefixMapping, uri string) bool {
 	return m.Matches(uri) && !strings.HasPrefix(uri, m.Target)
 }
 
-// headAll HEADs every uri with bounded concurrency and reports how many
-// are missing, naming the first few.
-func headAll(ctx context.Context, target Storage, uris []string) error {
+// checkFiles runs checkFile over every file with bounded concurrency and
+// reports how many failed, naming the first few.
+func checkFiles(ctx context.Context, target Storage, files []liveFile, mapping PrefixMapping) error {
 	var (
-		mu      sync.Mutex
-		missing []string
-		firstEr error
-		wg      sync.WaitGroup
-		sem     = make(chan struct{}, validateHeadConcurrency)
+		mu     sync.Mutex
+		failed []string
+		wg     sync.WaitGroup
+		sem    = make(chan struct{}, validateHeadConcurrency)
 	)
-	for _, uri := range uris {
+	for _, f := range files {
 		wg.Add(1)
 		sem <- struct{}{}
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			if _, err := target.HeadObject(ctx, uri); err != nil {
+			if err := checkFile(ctx, target, f, mapping); err != nil {
 				mu.Lock()
-				missing = append(missing, uri)
-				if firstEr == nil {
-					firstEr = err
-				}
+				failed = append(failed, f.uri+": "+err.Error())
 				mu.Unlock()
 			}
 		}()
 	}
 	wg.Wait()
-	if len(missing) == 0 {
+	if len(failed) == 0 {
 		return nil
 	}
-	slices.Sort(missing)
-	shown := missing[:min(len(missing), 5)]
-	return fmt.Errorf("%w: %d of %d live data/delete files not readable on target (e.g. %s): %w",
-		ErrValidationFailed, len(missing), len(uris), strings.Join(shown, ", "), firstEr)
+	slices.Sort(failed)
+	shown := failed[:min(len(failed), 5)]
+	return fmt.Errorf("%w: %d of %d live data/delete files failed on target: %s",
+		ErrValidationFailed, len(failed), len(files), strings.Join(shown, "; "))
 }
 
 // pickValidationSnapshot returns the snapshot ValidateAfterSwap should

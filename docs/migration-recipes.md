@@ -35,10 +35,13 @@ All four recipes assume:
   demotes per-table failures to logs.
 - **Verify the result yourself.** `bergrb`'s built-in validation checks
   the catalog pointer, the snapshot ID, that every live data and delete file
-  of the current snapshot exists on the target, and that no metadata URI
-  still names the source prefix — also when a re-run finds the table already
-  migrated. It checks presence, not content, and older snapshots' files are
-  not checked, so it is not proof of a complete copy.
+  of the current snapshot exists on the target at its declared size, that
+  no position-delete row and no metadata URI still names the source prefix —
+  also when a re-run finds the table already migrated. It does not read
+  data-file contents or older snapshots' files, so it is not proof of a
+  complete copy. A re-copy of only the data directory after the rebase
+  restores the original delete files and fails it; recover as for any
+  re-copy below.
   Compare row counts and checksums before and after, before you delete the
   source bucket.
 

@@ -236,8 +236,11 @@ For each table in scope:
        a. LoadTable; assert current-snapshot-id matches expected.
        b. Assert no path field of the new metadata.json, and no manifest or
           file URI of the current snapshot, still starts with the source prefix.
-       c. HEAD every live data and delete file of the current snapshot.
-       d. (Not implemented) DuckDB SELECT count(*).
+       c. HEAD every live data and delete file of the current snapshot;
+          its size must equal the manifest's file_size_in_bytes.
+       d. Read every live position-delete file; no file_path row may still
+          start with the source prefix.
+       e. (Not implemented) DuckDB SELECT count(*).
 ```
 
 ## Example operational pattern

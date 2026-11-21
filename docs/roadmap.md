@@ -103,8 +103,8 @@ real work tracked separately from the v1.0 milestone.
    one and Lakekeeper refuses the read. Mitigation: round-trip every
    written manifest and compare lengths before catalog swap; assertion
    covered by acceptance criterion #1 in [`testing.md`](./testing.md).
-3. **Best-effort validation**. `LoadTable` + source-prefix check + HEAD of
-   every live file is not a
+3. **Best-effort validation**. `LoadTable` + source-prefix check + HEAD and
+   size of every live file + position-delete rows is not a
    correctness proof — true correctness would compare every data-file
    checksum. Acceptable for v1; documented limit in
    [`testing.md`](./testing.md).

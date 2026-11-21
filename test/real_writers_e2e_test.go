@@ -795,7 +795,8 @@ func liveFiles(ctx context.Context, t *testing.T, s *harness.Stack, store *bergs
 // TestRealWriters_ValidationSeesWholeCopy: validation must notice any one live
 // file missing from the target, data or delete, not only the first; and a
 // plain re-copy of the source after the rebase, which puts the original
-// metadata back at the rewritten keys, must fail it too.
+// metadata back at the rewritten keys, must fail it too, as must a re-copy of
+// only the data directory, which restores the original position-delete files.
 func TestRealWriters_ValidationSeesWholeCopy(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping testcontainers test in short mode")
@@ -826,7 +827,12 @@ func TestRealWriters_ValidationSeesWholeCopy(t *testing.T) {
 	s.MinIO.CopyPrefix(ctx, t, bucket, key, bucket, "rebased/"+key)
 
 	// One file missing at a time: the last data file, then a delete file.
+	// Put back what the first run wrote, not the source object: a rewritten
+	// delete file differs from its original, and validation checks that.
 	for i, missing := range []string{data[len(data)-1], deletes[0]} {
+		if i > 0 {
+			s.MinIO.CopyPrefix(ctx, t, bucket, targetKey(missing), bucket, "saved/"+targetKey(missing))
+		}
 		s.MinIO.DeletePrefix(ctx, t, bucket, targetKey(missing))
 		run := s.RunBergrb(t, ns, src, dst)
 		if run.ExitCode == 0 {
@@ -835,7 +841,11 @@ func TestRealWriters_ValidationSeesWholeCopy(t *testing.T) {
 		if !strings.Contains(run.Log, strings.TrimPrefix(targetKey(missing), "rebased/")) {
 			t.Errorf("case %d: log does not name the missing file %s:\n%s", i, missing, tail(run.Log))
 		}
-		s.MinIO.CopyPrefix(ctx, t, bucket, strings.TrimPrefix(missing, "s3://"+bucket+"/"), bucket, targetKey(missing))
+		if i > 0 {
+			s.MinIO.CopyPrefix(ctx, t, bucket, "saved/"+targetKey(missing), bucket, targetKey(missing))
+		} else {
+			s.MinIO.CopyPrefix(ctx, t, bucket, strings.TrimPrefix(missing, "s3://"+bucket+"/"), bucket, targetKey(missing))
+		}
 		if run := s.RunBergrb(t, ns, src, dst); run.ExitCode != 0 {
 			t.Fatalf("case %d: re-run with the copy complete: exit %d\n%s", i, run.ExitCode, tail(run.Log))
 		}
@@ -856,6 +866,23 @@ func TestRealWriters_ValidationSeesWholeCopy(t *testing.T) {
 	s.SwapTableBack(ctx, t, ns, "t", before.MetadataLocation)
 	if run := s.RunBergrb(t, ns, src, dst); run.ExitCode != 0 {
 		t.Fatalf("re-run after swapping back: exit %d\n%s", run.ExitCode, tail(run.Log))
+	}
+
+	// A re-copy of only the data directory: metadata and manifests stay
+	// rewritten, but the original position-delete files, whose rows name the
+	// source, replace the rewritten ones. Readers would stop applying them.
+	dataDir := strings.TrimPrefix(deletes[0][:strings.LastIndex(deletes[0], "/")+1], "s3://"+bucket+"/")
+	s.MinIO.CopyPrefix(ctx, t, bucket, dataDir, bucket, "rebased/"+dataDir)
+	run = s.RunBergrb(t, ns, src, dst)
+	if run.ExitCode == 0 {
+		t.Fatalf("bergrb exited 0 after the source data/ prefix was re-copied over the rebase:\n%s", tail(run.Log))
+	}
+	if !strings.Contains(run.Log, strings.TrimPrefix(targetKey(deletes[0]), "rebased/")) {
+		t.Errorf("log does not name the restored delete file %s:\n%s", deletes[0], tail(run.Log))
+	}
+	s.SwapTableBack(ctx, t, ns, "t", before.MetadataLocation)
+	if run := s.RunBergrb(t, ns, src, dst); run.ExitCode != 0 {
+		t.Fatalf("re-run after swapping back from the data/ re-copy: exit %d\n%s", run.ExitCode, tail(run.Log))
 	}
 	s.MinIO.DeletePrefix(ctx, t, bucket, key)
 	compareState(t, "t", pre, captureState(ctx, t, s, reader, nil, ns, "t"))

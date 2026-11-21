@@ -31,7 +31,8 @@ A release is acceptance-ready when **all** of the following hold:
    `metadata-location` does not start with `--source-prefix`, the tool
    exits non-zero with an actionable error message and never writes.
 8. **Documented best-effort validation** — the post-migration validation
-   step (`LoadTable` + source-prefix check + HEAD of every live file) runs
+   step (`LoadTable` + source-prefix check + HEAD and size of every live
+   file + position-delete rows) runs
    by default but is best-effort.
    Its limitations are documented in this file.
 
@@ -147,7 +148,7 @@ message** (refusal must name the unsupported feature: "Puffin" and
 | `TestRealWriters_BucketMove`             | DuckDB                   | `docs/migration-recipes.md` §1: refused without the warehouse row edit, correct with it                   |
 | `TestRealWriters_UpgradedTable`          | pyiceberg (v1 upgraded to v2) | `manifest_length` equals the object size in every list; a second migration works                     |
 | `TestRealWriters_IncompleteCopy`         | DuckDB                   | a re-run keeps failing while files are missing; swap-back and finishing the copy both recover            |
-| `TestRealWriters_ValidationSeesWholeCopy` | DuckDB                   | any one live data or delete file missing fails validation; so does a source re-copied over the rebase  |
+| `TestRealWriters_ValidationSeesWholeCopy` | DuckDB                   | any one live data or delete file missing fails validation; so does a source re-copied over the rebase, whole or only its data directory |
 | `TestRealWriters_Scale`                  | DuckDB, pyiceberg        | many snapshots, manifests and data files (nightly-gated; on in CI)                                        |
 
 ## Validation step in the binary itself
@@ -162,8 +163,12 @@ The `bergrb` binary runs a built-in post-rebase validation:
    This catches a source re-copied over the rewritten metadata, whose URIs
    target credentials might still resolve.
 3. `HEAD` every live (not DELETED) data and delete file of the current
-   snapshot on the target, with bounded concurrency; fail naming the missing
-   ones.
+   snapshot on the target, with bounded concurrency, and compare its size
+   with the manifest's `file_size_in_bytes`; fail naming the bad ones.
+4. Read every live position-delete file and fail if a `file_path` row still
+   starts with the source prefix. A re-copy of just the data directory puts
+   the original delete files back at the rewritten keys; readers match
+   deletes by path, so the deleted rows would silently return.
 
 A re-run that finds the table already migrated runs the same checks, so a failed
 validation does not turn into exit 0 the second time.
@@ -171,8 +176,9 @@ validation does not turn into exit 0 the second time.
 This is **best-effort**, not a correctness proof, and it runs **after** the
 catalog swap: a failure here means the catalog already points at the new
 location, and `bergrb` does not roll it back. It cannot see wrong row counts,
-as deleted rows coming back did not fail it, nor a truncated object, nor a
-missing file that only an older snapshot references. A truly complete check would
+as deleted rows coming back did not fail it, nor a data file replaced by
+another of the same size, nor a missing file that only an older snapshot
+references. A truly complete check would
 re-read every data file's footer and compare per-column min/max bounds and row
 counts to what the manifest claims — expensive and not worth the wall-clock
 cost for v1. Operators should compare counts and checksums themselves before
