@@ -38,8 +38,8 @@ type Table struct {
 }
 
 // Catalog is the swap surface the rewriter depends on. Read operations
-// list and load tables; write operations atomically re-point the metadata
-// location.
+// list and load tables; the write operation re-points the metadata
+// location, atomically only where the catalog supports it.
 //
 // Implementations should be safe to call from a single goroutine; the
 // rewriter does not invoke them concurrently per table.
@@ -56,8 +56,7 @@ type Catalog interface {
 	// LoadTable returns the current pointer state for a table.
 	LoadTable(ctx context.Context, id Identifier) (*Table, error)
 
-	// SwapMetadataLocation atomically re-points id from oldLocation to
-	// newLocation.
+	// SwapMetadataLocation re-points id from oldLocation to newLocation.
 	//
 	// Implementations should prefer a single atomic catalog call when the
 	// underlying API supports it (REST register-with-overwrite, JDBC row

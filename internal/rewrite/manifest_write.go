@@ -3,11 +3,16 @@ package rewrite
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
+	"strconv"
 
 	iceberg "github.com/apache/iceberg-go"
+	"github.com/hamba/avro/v2"
+	"github.com/hamba/avro/v2/ocf"
 )
 
 // RewriteManifest reads the Avro manifest pointed to by mf, applies
@@ -39,19 +44,76 @@ import (
 //     values), so no body rewrite is needed.
 //   - Any other content type → refuse (defensive; iceberg-go has no
 //     other constants today, but this protects against future drift).
+//
+// A DELETED position-delete entry is a tombstone: readers never open its file,
+// and expiry may already have removed it. Only its paths are rewritten, so its
+// file_size_in_bytes keeps the original size even if a live entry elsewhere had
+// the same file's body re-encoded.
 func RewriteManifest(ctx context.Context, src, target Storage, mf iceberg.ManifestFile, mapping PrefixMapping) (iceberg.ManifestFile, []PathHit, error) {
+	return manifestMemo{}.rewrite(ctx, src, target, mf, mapping)
+}
+
+// manifestMemo holds the output of each manifest already rewritten in a table,
+// by source URI. A manifest referenced by many snapshots' lists has one output
+// object, so it must be written once: a second write can change its bytes, and
+// the lists already recorded the first one's manifest_length.
+type manifestMemo map[string]writtenManifest
+
+type writtenManifest struct {
+	file iceberg.ManifestFile // nil when nothing in the manifest changed
+	hits []PathHit
+}
+
+// rewrite returns the manifest-list entry for mf, writing the manifest only the
+// first time its URI is seen. The entry takes its list-level fields from mf,
+// because those belong to the referencing list: the same manifest has no
+// first_row_id in a v2 list and has one in a v3 list.
+func (m manifestMemo) rewrite(ctx context.Context, src, target Storage, mf iceberg.ManifestFile, mapping PrefixMapping) (iceberg.ManifestFile, []PathHit, error) {
+	written, ok := m[mf.FilePath()]
+	if !ok {
+		file, hits, err := writeRewrittenManifest(ctx, src, target, mf, mapping)
+		if err != nil {
+			return nil, nil, err
+		}
+		written = writtenManifest{file: file, hits: hits}
+		m[mf.FilePath()] = written
+	}
+	if written.file == nil {
+		return mf, written.hits, nil
+	}
+	// iceberg's manifest writer produces a ManifestFile with SeqNumber=-1
+	// (unassigned). For manifests carried forward from prior snapshots,
+	// WriteManifestList rejects unassigned sequences with "found
+	// unassigned sequence number for a manifest from snapshot X != Y".
+	// Preserve the original mf's sequence numbers so the rewritten copy
+	// re-encodes into the parent list cleanly.
+	carried, err := preserveSequenceNumbers(written.file, mf)
+	if err != nil {
+		return nil, nil, fmt.Errorf("manifest %s: %w", written.file.FilePath(), err)
+	}
+	return carried, written.hits, nil
+}
+
+// writeRewrittenManifest does the work of RewriteManifest. It returns a nil file
+// when no path changed and nothing was written.
+//
+// The output keeps the manifest's own format version, from its header, and not
+// the version of the list referencing it: a table upgraded across format
+// versions keeps old manifests, and a v2 list cannot reference a v3 manifest.
+func writeRewrittenManifest(ctx context.Context, src, target Storage, mf iceberg.ManifestFile, mapping PrefixMapping) (iceberg.ManifestFile, []PathHit, error) {
 	raw, err := src.GetObject(ctx, mf.FilePath())
 	if err != nil {
 		return nil, nil, fmt.Errorf("read manifest %s: %w", mf.FilePath(), err)
 	}
 
+	raw = normalizeDeleteManifestHeader(mf, raw)
 	reader, err := iceberg.NewManifestReader(mf, bytes.NewReader(raw))
 	if err != nil {
 		return nil, nil, fmt.Errorf("decode manifest %s: %w", mf.FilePath(), err)
 	}
-	schema, err := reader.Schema()
+	header, err := manifestHeader(raw)
 	if err != nil {
-		return nil, nil, fmt.Errorf("manifest %s: read schema: %w", mf.FilePath(), err)
+		return nil, nil, fmt.Errorf("manifest %s: read header: %w", mf.FilePath(), err)
 	}
 	spec, err := reader.PartitionSpec()
 	if err != nil {
@@ -79,6 +141,14 @@ func RewriteManifest(ctx context.Context, src, target Storage, mf iceberg.Manife
 			if isPuffinPath(df.FilePath()) {
 				return nil, nil, fmt.Errorf("%w: manifest %s entry %d points at Puffin file %s (V3 deletion vector)",
 					ErrUnsupportedFeature, mf.FilePath(), i, df.FilePath())
+			}
+			if e.Status() == iceberg.EntryStatusDELETED {
+				changed, err := rewriteDataFileBoundsForField(df, reservedFieldIDFilePath, mapping)
+				if err != nil {
+					return nil, nil, fmt.Errorf("manifest %s entry %d: %w", mf.FilePath(), i, err)
+				}
+				mutated = mutated || changed
+				break
 			}
 			// Rewrite the position-delete Parquet body: the file_path
 			// column inside embeds absolute data-file URIs. The body
@@ -112,15 +182,10 @@ func RewriteManifest(ctx context.Context, src, target Storage, mf iceberg.Manife
 			mutated = true
 		}
 		if ref := df.ReferencedDataFile(); ref != nil && *ref != "" {
-			oldRef := *ref
-			newRef := mapping.Apply(oldRef)
-			hits = append(hits, PathHit{
-				Field: fmt.Sprintf("manifest[%s].entries[%d].data_file.referenced_data_file", mf.FilePath(), i),
-				Old:   oldRef,
-				New:   newRef,
-			})
-			if oldRef != newRef {
-				if err := setDataFileReferencedDataFile(df, newRef); err != nil {
+			refHit := referencedDataFileHit(mf, i, *ref, header.version, mapping)
+			hits = append(hits, refHit)
+			if header.version >= minVersionWithReferencedDataFile && refHit.Rewritten() {
+				if err := setDataFileReferencedDataFile(df, refHit.New); err != nil {
 					return nil, nil, fmt.Errorf("mutate manifest %s entry %d referenced_data_file: %w", mf.FilePath(), i, err)
 				}
 				mutated = true
@@ -130,7 +195,7 @@ func RewriteManifest(ctx context.Context, src, target Storage, mf iceberg.Manife
 
 	if !mutated {
 		// Idempotent: no path changed, leave the file alone.
-		return mf, hits, nil
+		return nil, hits, nil
 	}
 
 	// A manifest that lives outside the source prefix but references
@@ -153,13 +218,13 @@ func RewriteManifest(ctx context.Context, src, target Storage, mf iceberg.Manife
 	// reject the file.
 	buf := &bytes.Buffer{}
 	cw := &lengthCountingWriter{w: buf}
-	w, err := iceberg.NewManifestWriter(mf.Version(), cw, *spec, schema, mf.SnapshotID(),
+	w, err := iceberg.NewManifestWriter(header.version, cw, *spec, header.schema, mf.SnapshotID(),
 		iceberg.WithManifestWriterContent(mf.ManifestContent()))
 	if err != nil {
 		return nil, nil, fmt.Errorf("write manifest %s -> %s: %w", mf.FilePath(), newURI, err)
 	}
 	for _, entry := range entries {
-		if err := w.Add(entry); err != nil {
+		if err := addEntryKeepingStatus(w, mf, entry); err != nil {
 			return nil, nil, fmt.Errorf("write manifest %s -> %s: %w", mf.FilePath(), newURI, err)
 		}
 	}
@@ -174,13 +239,194 @@ func RewriteManifest(ctx context.Context, src, target Storage, mf iceberg.Manife
 	if err := putAndVerify(ctx, target, newURI, buf.Bytes()); err != nil {
 		return nil, nil, fmt.Errorf("manifest %s: %w", newURI, err)
 	}
-	// iceberg.WriteManifest produces a ManifestFile with SeqNumber=-1
-	// (unassigned). For manifests carried forward from prior snapshots,
-	// WriteManifestList rejects unassigned sequences with "found
-	// unassigned sequence number for a manifest from snapshot X != Y".
-	// Preserve the original mf's sequence numbers so the rewritten copy
-	// re-encodes into the parent list cleanly.
-	return preserveSequenceNumbers(newMF, mf), hits, nil
+	return newMF, hits, nil
+}
+
+// minVersionWithReferencedDataFile is the first format version whose manifest
+// schema in iceberg-go has referenced_data_file (field 143). The Iceberg spec
+// allows the field on V2 too, but iceberg-go's v2 schema does not, so a rewritten
+// V2 manifest loses it. That is safe: it is only an index hint, and readers fall
+// back to the delete file's own file_path column.
+const minVersionWithReferencedDataFile = 3
+
+// referencedDataFileHit reports what happens to an entry's referenced_data_file.
+// In a manifest whose format cannot keep the field, New is empty: it is dropped.
+func referencedDataFileHit(mf iceberg.ManifestFile, entry int, ref string, version int, mapping PrefixMapping) PathHit {
+	hit := PathHit{
+		Field: fmt.Sprintf("manifest[%s].entries[%d].data_file.referenced_data_file", mf.FilePath(), entry),
+		Old:   ref,
+	}
+	if version >= minVersionWithReferencedDataFile {
+		hit.New = mapping.Apply(ref)
+	}
+	return hit
+}
+
+// addEntryKeepingStatus re-encodes entry with the status its writer gave it.
+// ManifestWriter.Add stamps ADDED unconditionally: a DELETED entry written that
+// way resurrects its data file, so deleted rows come back with no error.
+//
+// Add and Delete also stamp the manifest's own snapshot ID. In a V2+ manifest
+// that is what the entry already carries; refuse the entry if it is not, since
+// the writer has no way to keep it. A V1 descriptor has no added_snapshot_id of
+// its own (see loadV1ManifestDescriptor), so V1 is exempt.
+func addEntryKeepingStatus(w *iceberg.ManifestWriter, mf iceberg.ManifestFile, entry iceberg.ManifestEntry) error {
+	if err := checkEntrySnapshot(mf, entry); err != nil {
+		return err
+	}
+	switch status := entry.Status(); status {
+	case iceberg.EntryStatusADDED:
+		return w.Add(entry)
+	case iceberg.EntryStatusEXISTING:
+		return w.Existing(entry)
+	case iceberg.EntryStatusDELETED:
+		return w.Delete(entry)
+	default:
+		return fmt.Errorf("%w: manifest entry has unknown status %d", ErrUnsupportedFeature, status)
+	}
+}
+
+// checkEntrySnapshot refuses an entry the writer could not reproduce; see
+// addEntryKeepingStatus.
+func checkEntrySnapshot(mf iceberg.ManifestFile, entry iceberg.ManifestEntry) error {
+	if mf.Version() >= 2 && entry.Status() != iceberg.EntryStatusEXISTING && entry.SnapshotID() != mf.SnapshotID() {
+		return fmt.Errorf("%w: entry for %s has snapshot %d but its manifest was added by snapshot %d",
+			ErrUnsupportedFeature, entry.DataFile().FilePath(), entry.SnapshotID(), mf.SnapshotID())
+	}
+	return nil
+}
+
+// parsedManifestHeader is what the rewriter needs from a manifest's OCF header.
+type parsedManifestHeader struct {
+	schema  *iceberg.Schema
+	version int
+}
+
+// manifestHeader reads a manifest's schema and format version. iceberg-go's
+// ManifestReader.Schema insists on the separate schema-id key, which pyiceberg
+// does not write; the same id is normally inside the schema JSON as well, and
+// the header key wins when both are present. format-version is optional only on
+// V1 manifests, so an absent key means V1.
+func manifestHeader(raw []byte) (parsedManifestHeader, error) {
+	dec, err := ocf.NewDecoder(bytes.NewReader(raw), ocf.WithDecoderSchemaCache(&avro.SchemaCache{}))
+	if err != nil {
+		return parsedManifestHeader{}, err
+	}
+	defer func() { _ = dec.Close() }()
+	meta := dec.Metadata()
+	schema := &iceberg.Schema{}
+	if err := json.Unmarshal(meta["schema"], schema); err != nil {
+		return parsedManifestHeader{}, fmt.Errorf("'schema' metadata is invalid: %w", err)
+	}
+	if v := string(meta["schema-id"]); v != "" {
+		id, err := strconv.Atoi(v)
+		if err != nil {
+			return parsedManifestHeader{}, fmt.Errorf("'schema-id' metadata is invalid: %w", err)
+		}
+		schema.ID = id
+	}
+	version := 1
+	if v := string(meta["format-version"]); v != "" {
+		if version, err = strconv.Atoi(v); err != nil {
+			return parsedManifestHeader{}, fmt.Errorf("'format-version' metadata is invalid: %w", err)
+		}
+	}
+	return parsedManifestHeader{schema: schema, version: version}, nil
+}
+
+// normalizeDeleteManifestHeader corrects one specific writer bug: DuckDB up to
+// and including 1.5.4 labels delete manifests content=data in their OCF header,
+// while the manifest list says deletes. iceberg-go refuses that mismatch, and
+// no reader option relaxes it, so the header is corrected before decoding. The
+// entries themselves then still have to be delete files or decoding fails, and
+// the rewritten manifest carries the correct label.
+//
+// Only that exact disagreement is touched. Anything else, including an
+// unparseable header, returns raw unchanged for iceberg-go to judge.
+func normalizeDeleteManifestHeader(mf iceberg.ManifestFile, raw []byte) []byte {
+	if mf.ManifestContent() != iceberg.ManifestContentDeletes {
+		return raw
+	}
+	pairs, end, ok := parseOCFMetadata(raw)
+	if !ok {
+		return raw
+	}
+	mislabelled := false
+	for i := range pairs {
+		if string(pairs[i][0]) == "content" && string(pairs[i][1]) == "data" {
+			pairs[i][1] = []byte("deletes")
+			mislabelled = true
+		}
+	}
+	if !mislabelled {
+		return raw
+	}
+	out := append(make([]byte, 0, len(raw)+len("deletes")), raw[:len(ocfMagic)]...)
+	out = binary.AppendVarint(out, int64(len(pairs)))
+	for _, kv := range pairs {
+		for _, s := range kv {
+			out = binary.AppendVarint(out, int64(len(s)))
+			out = append(out, s...)
+		}
+	}
+	out = binary.AppendVarint(out, 0)
+	return append(out, raw[end:]...)
+}
+
+const ocfMagic = "Obj\x01"
+
+// parseOCFMetadata reads the key/value map at the start of an Avro object
+// container file. It returns the pairs and the offset just past the map, or
+// false if raw is not a well-formed header. Avro's long encoding is the same
+// zigzag varint as encoding/binary's.
+func parseOCFMetadata(raw []byte) (pairs [][2][]byte, end int, ok bool) {
+	if !bytes.HasPrefix(raw, []byte(ocfMagic)) {
+		return nil, 0, false
+	}
+	pos := len(ocfMagic)
+	long := func() (int64, bool) {
+		v, n := binary.Varint(raw[pos:])
+		if n <= 0 {
+			return 0, false
+		}
+		pos += n
+		return v, true
+	}
+	str := func() ([]byte, bool) {
+		l, ok := long()
+		if !ok || l < 0 || l > int64(len(raw)-pos) {
+			return nil, false
+		}
+		s := raw[pos : pos+int(l)]
+		pos += int(l)
+		return s, true
+	}
+	for {
+		count, ok := long()
+		if !ok {
+			return nil, 0, false
+		}
+		if count == 0 {
+			return pairs, pos, true
+		}
+		if count < 0 { // A negative block count is followed by the block's byte size.
+			count = -count
+			if _, ok := long(); !ok {
+				return nil, 0, false
+			}
+		}
+		for range count {
+			k, ok := str()
+			if !ok {
+				return nil, 0, false
+			}
+			v, ok := str()
+			if !ok {
+				return nil, 0, false
+			}
+			pairs = append(pairs, [2][]byte{k, v})
+		}
+	}
 }
 
 // preserveSequenceNumbers returns newMF with the original mf's
@@ -201,7 +447,11 @@ func RewriteManifest(ctx context.Context, src, target Storage, mf iceberg.Manife
 // iceberg.WriteManifest recomputes them from the entries it just
 // wrote. Dropping them would silently cost engines manifest-level
 // partition pruning on every migrated table.
-func preserveSequenceNumbers(newMF, originalMF iceberg.ManifestFile) iceberg.ManifestFile {
+//
+// first_row_id must come from originalMF too. Left unset, the manifest list
+// writer allocates fresh values, changing the _row_id of every row in a V3
+// table with more than one snapshot.
+func preserveSequenceNumbers(newMF, originalMF iceberg.ManifestFile) (iceberg.ManifestFile, error) {
 	b := iceberg.NewManifestFile(
 		newMF.Version(),
 		newMF.FilePath(),
@@ -221,7 +471,31 @@ func preserveSequenceNumbers(newMF, originalMF iceberg.ManifestFile) iceberg.Man
 	if p := newMF.Partitions(); len(p) > 0 {
 		b = b.Partitions(p)
 	}
-	return b.Build()
+	built := b.Build()
+	if err := setManifestFirstRowID(built, originalMF.FirstRowID()); err != nil {
+		return nil, err
+	}
+	return built, nil
+}
+
+// setManifestFirstRowID sets first_row_id on a ManifestFile. iceberg-go's
+// ManifestBuilder has no setter for it, so like setDataFilePath this goes
+// through reflection, and an API rename fails loudly instead of losing lineage.
+func setManifestFirstRowID(mf iceberg.ManifestFile, id *int64) error {
+	if id == nil {
+		return nil
+	}
+	v := reflect.ValueOf(mf)
+	if v.Kind() != reflect.Pointer || v.IsNil() || v.Elem().Kind() != reflect.Struct {
+		return errors.New("ManifestFile is not a pointer to struct (iceberg-go API drift?)")
+	}
+	field := v.Elem().FieldByName("FirstRowIDValue")
+	if !field.IsValid() || !field.CanSet() || field.Type() != reflect.TypeFor[*int64]() {
+		return errors.New("ManifestFile.FirstRowIDValue is not a settable *int64 (iceberg-go API drift?)")
+	}
+	val := *id
+	field.Set(reflect.ValueOf(&val))
+	return nil
 }
 
 // RewriteManifestList writes a new manifest list at the URI substituted
@@ -244,12 +518,21 @@ func RewriteManifestList(
 ) (string, error) {
 	newURI := mapping.Apply(listURI)
 	buf := &bytes.Buffer{}
+	if headerMeta.SnapshotID == nil {
+		return "", fmt.Errorf("encode manifest list %s -> %s: snapshot id unknown", listURI, newURI)
+	}
+	var firstRowID int64
+	if headerMeta.FirstRowID != nil {
+		firstRowID = *headerMeta.FirstRowID
+	} else if version >= 3 {
+		return "", fmt.Errorf("encode manifest list %s -> %s: %w: V3 list has no first-row-id", listURI, newURI, ErrUnsupportedFeature)
+	}
 	if err := iceberg.WriteManifestList(
 		version, buf,
-		headerMeta.SnapshotID,
+		*headerMeta.SnapshotID,
 		headerMeta.ParentSnapshotID,
 		headerMeta.SequenceNumber,
-		headerMeta.FirstRowID,
+		firstRowID,
 		files,
 	); err != nil {
 		return "", fmt.Errorf("encode manifest list %s -> %s: %w", listURI, newURI, err)
@@ -265,10 +548,10 @@ func RewriteManifestList(
 // original list's OCF metadata in WalkManifestList so that the rewrite
 // preserves snapshot identity.
 type ManifestListHeader struct {
-	SnapshotID       int64
+	SnapshotID       *int64
 	ParentSnapshotID *int64
 	SequenceNumber   *int64 // V2/V3 only; nil for V1
-	FirstRowID       int64  // V3 only
+	FirstRowID       *int64 // V3 only
 }
 
 // lengthCountingWriter counts bytes written through it. The manifest

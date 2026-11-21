@@ -35,7 +35,7 @@ func MaybeSkipNoDuckDB(t *testing.T) {
 	t.Helper()
 	duckdbProbeOnce.Do(probeDuckDB)
 	if duckdbProbeErr != nil {
-		t.Skip(duckdbProbeErr.Error())
+		SkipOrFail(t, "%s", duckdbProbeErr.Error())
 	}
 }
 

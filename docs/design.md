@@ -3,7 +3,8 @@
 `bergrebase` rebases an Apache Iceberg table onto a new object-storage
 backing: data is copied byte-for-byte to the new bucket, every metadata
 file is rewritten so its absolute URIs reference the new location, and
-the catalog pointer is atomically swapped. The table identity, history,
+the catalog pointer is swapped (atomically where the catalog supports
+register-with-overwrite; see D2). The table identity, history,
 schema, and snapshot IDs are preserved.
 
 This document covers the architecture: what gets rewritten, the design
@@ -48,10 +49,16 @@ Drawn from the Iceberg [table spec](https://iceberg.apache.org/spec/) and
 | Field                                                                                  | Path?                                                                                                                                                                                                                                                                        |
 |----------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `data_file.file_path` (id 100)                                                         | YES                                                                                                                                                                                                                                                                          |
-| `data_file.referenced_data_file` (id 143, V2+ for delete files, V3 mandatory for DVs)  | YES                                                                                                                                                                                                                                                                          |
+| `data_file.referenced_data_file` (id 143, V2+ for delete files, V3 mandatory for DVs; **dropped from V2 manifests on rewrite**, see below)  | YES                                                                                                                                                                                                                                                                          |
 | `data_file.lower_bounds` / `upper_bounds` (ids 125/128)                                | NO for data and equality-delete entries, even if a data column literally holds bucket strings — bounds describe data, not paths. **YES for position-delete entries, field id 2147483546 only**: those bounds hold absolute data-file URIs and engines match delete files by them |
 | `data_file.file_size_in_bytes` (id 104)                                                | NO for byte-copied files. **YES for position-delete entries**: the body re-encode can change the byte length, and readers open the file at the declared length. `split_offsets` / `column_sizes` describe the old layout and are cleared on those entries                        |
 | `data_file.content_offset`, `content_size_in_bytes` (V3 DV)                            | NO — offsets inside the Puffin, unaffected by metadata-only rewrites                                                                                                                                                                                                         |
+
+`referenced_data_file` is lost on V2 because iceberg-go's v2 manifest schema has
+no field 143, so `bergrb` reports it as dropped (a hit with an empty `New`). This
+is the one deliberate exception to preserving everything that is not a path.
+Refusing would block DuckDB 2.0's V2 tables, and the field is only a hint: readers
+fall back to the delete file's own `file_path` column.
 
 ### Position delete files (V2)
 
@@ -100,14 +107,17 @@ one written next to it". Mitigation: the source bucket is preserved during
 the migration window, so the originals stay intact in the source until the
 operator finalizes.
 
-### D2. Atomic catalog swap: register-with-overwrite, falling back to Drop+Register
+### D2. Catalog swap: register-with-overwrite, falling back to Drop+Register
 
 The preferred swap is a single atomic call:
 
 1. `POST /v1/{prefix}/namespaces/{ns}/register?overwrite=true` with the
-   new `metadata-location`.
+   new `metadata-location` and `"overwrite": true` in the body. The spec's
+   `RegisterTableRequest` carries `overwrite` as a body field; Lakekeeper
+   v0.12.4 reads only the body and answers 409 to the query parameter alone.
 
-When the catalog doesn't support that variant, fall back to two-step:
+When the catalog doesn't honour that, fall back to two-step, which is
+**not atomic**:
 
 1. `DELETE /v1/{prefix}/namespaces/{ns}/tables/{table}?purgeRequested=false`
    — frees the identifier, **leaves files alone**.
@@ -124,8 +134,10 @@ propagate without poisoning the cache (transient errors retry detection
 on the next swap). The pre-swap `LoadTable` drift check runs before
 either path.
 
-Polaris and recent Lakekeeper hit the atomic path; older Lakekeeper
-versions fall back. The brief unavailability between drop and register
+Tested behaviour: Lakekeeper v0.12.4 takes the single-call path
+(`TestMigrateOne_E2E_Lakekeeper` asserts no DELETE); Polaris 1.4.0 does
+not honour `overwrite` and takes the fallback (`TestMigrateOne_E2E_Polaris`
+pins that). Other catalogs are untested. The brief unavailability between drop and register
 in the fallback path is bounded to one HTTP round-trip, and writers
 should be paused for the entire migration window anyway (see
 [§ Example operational pattern](#example-operational-pattern)). The
@@ -139,7 +151,7 @@ metadata.json is intact in object storage, but the catalog entry must
 be re-registered manually — `bergrb` cannot resume because it no
 longer has a `LoadTable` source of truth to compare against. The
 atomic register-with-overwrite path **does not** have this window.
-Operators on stacks that exercise the fallback (older Lakekeeper) should
+Operators on stacks that exercise the fallback (Polaris 1.4.0) should
 be aware that resume after process death may need manual intervention;
 prefer catalogs that support `register?overwrite=true`.
 
@@ -215,14 +227,17 @@ For each table in scope:
        - properties[write.object-storage.path / write.data.path /
          write.metadata.path / write.folder-storage.path]
   4. Write the new metadata.json bytes at substitutePrefix(oldMetaLoc).
-  5. Catalog swap:
-       a. catalog.DropTable(purgeRequested=false)
-       b. catalog.RegisterTable(newMetadataLocation)
+  5. Catalog swap (D2):
+       a. RegisterTable(newMetadataLocation, overwrite=true); done if honoured.
+       b. Otherwise catalog.DropTable(purgeRequested=false)
+          then catalog.RegisterTable(newMetadataLocation) — not atomic.
        c. On register error: best-effort RegisterTable(oldMetadataLocation).
   6. Validate (unless --no-validate):
        a. LoadTable; assert current-snapshot-id matches expected.
-       b. HEAD one data file URI from the latest snapshot's manifest.
-       c. (Optional, future) DuckDB SELECT count(*).
+       b. Assert no path field of the new metadata.json, and no manifest or
+          file URI of the current snapshot, still starts with the source prefix.
+       c. HEAD every live data and delete file of the current snapshot.
+       d. (Not implemented) DuckDB SELECT count(*).
 ```
 
 ## Example operational pattern
@@ -243,9 +258,9 @@ owns those concerns. A typical sequence:
    keys under the new prefix.
 3. **Run `bergrb`** with `--source-prefix` / `--target-prefix` and
    credentials for both sides. The engine walks the metadata graph
-   bottom-up, rewrites paths, and atomically swaps the catalog
-   pointer.
-4. **Validate** (`bergrb` does a best-effort `LoadTable` + HEAD by
+   bottom-up, rewrites paths, and swaps the catalog pointer (D2).
+4. **Validate** (`bergrb` does a `LoadTable`, a source-prefix check and a HEAD
+   of every live file by
    default; the orchestrator can layer its own `SELECT count(*)` /
    checksum check on top).
 5. **Resume writers** against the new bucket.

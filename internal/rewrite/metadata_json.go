@@ -1,9 +1,19 @@
 package rewrite
 
 import (
+	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
+	"io"
 )
+
+// maxInflatedMetadataSize caps a decompressed metadata.json, so a corrupt or
+// hostile object fails with an error rather than inflating without limit:
+// storage's --max-object-size only bounds the compressed bytes. It is a bound,
+// not a guarantee. The process still needs up to this much memory, and can run
+// out on a smaller machine.
+const maxInflatedMetadataSize = 4 << 30
 
 // MetadataJSON is the subset of an Iceberg metadata.json document that
 // holds path-bearing fields. Unknown fields are preserved verbatim via
@@ -28,10 +38,18 @@ type MetadataJSON struct {
 
 // SnapshotJSON captures the path-bearing fields of a snapshot. V2+ uses
 // ManifestList; V1 uses the flat Manifests list.
+//
+// ParentSnapshotID, SequenceNumber and FirstRowID are not paths. They are here
+// because rewriting a manifest list needs them, and metadata.json is the only
+// place the spec guarantees them: DuckDB's manifest lists carry none of them
+// in their OCF header.
 type SnapshotJSON struct {
-	SnapshotID   int64    `json:"snapshot-id"`
-	ManifestList string   `json:"manifest-list,omitempty"`
-	Manifests    []string `json:"manifests,omitempty"`
+	SnapshotID       int64    `json:"snapshot-id"`
+	ParentSnapshotID *int64   `json:"parent-snapshot-id,omitempty"`
+	SequenceNumber   *int64   `json:"sequence-number,omitempty"`
+	FirstRowID       *int64   `json:"first-row-id,omitempty"`
+	ManifestList     string   `json:"manifest-list,omitempty"`
+	Manifests        []string `json:"manifests,omitempty"`
 }
 
 // MetadataLogEntryJSON is one element of metadata-log[].
@@ -50,13 +68,57 @@ type StatisticsFileJSON struct {
 // ParseMetadataJSON decodes raw into a MetadataJSON. The write path
 // re-serialises through a generic map[string]any (see metadata_write.go)
 // rather than byte-level round-tripping, so the original bytes are not
-// retained.
+// retained. raw may be gzip-compressed (see inflateMetadataJSON).
 func ParseMetadataJSON(raw []byte) (*MetadataJSON, error) {
+	raw, _, err := inflateMetadataJSON(raw)
+	if err != nil {
+		return nil, err
+	}
 	m := &MetadataJSON{}
 	if err := json.Unmarshal(raw, m); err != nil {
 		return nil, fmt.Errorf("parse metadata.json: %w", err)
 	}
 	return m, nil
+}
+
+// inflateMetadataJSON returns the JSON text of a metadata file and whether it
+// was gzip-compressed. Lakekeeper gzips metadata unless a table sets
+// write.metadata.compression-codec=none, naming it *.gz.metadata.json.
+//
+// Detection is by content rather than by file name: a JSON document cannot
+// begin with the gzip magic bytes, so this cannot misfire, and it also covers
+// the legacy *.metadata.json.gz spelling.
+func inflateMetadataJSON(raw []byte) ([]byte, bool, error) {
+	if len(raw) < 2 || raw[0] != 0x1f || raw[1] != 0x8b {
+		return raw, false, nil
+	}
+	zr, err := gzip.NewReader(bytes.NewReader(raw))
+	if err != nil {
+		return nil, false, fmt.Errorf("gunzip metadata.json: %w", err)
+	}
+	defer func() { _ = zr.Close() }()
+	out, err := io.ReadAll(io.LimitReader(zr, maxInflatedMetadataSize+1))
+	if err != nil {
+		return nil, false, fmt.Errorf("gunzip metadata.json: %w", err)
+	}
+	if len(out) > maxInflatedMetadataSize {
+		return nil, false, fmt.Errorf("gunzip metadata.json: inflated size exceeds %d bytes", int64(maxInflatedMetadataSize))
+	}
+	return out, true, nil
+}
+
+// deflateMetadataJSON is the inverse of inflateMetadataJSON. The gzip header
+// carries no timestamp, so equal input gives equal output.
+func deflateMetadataJSON(doc []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write(doc); err != nil {
+		return nil, fmt.Errorf("gzip metadata.json: %w", err)
+	}
+	if err := zw.Close(); err != nil {
+		return nil, fmt.Errorf("gzip metadata.json: %w", err)
+	}
+	return buf.Bytes(), nil
 }
 
 // PathHit describes a single path-bearing field encountered during a

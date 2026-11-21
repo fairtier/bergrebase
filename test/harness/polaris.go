@@ -89,7 +89,7 @@ func StartPolarisStack(ctx context.Context, t *testing.T) *PolarisStack {
 	net, err := network.New(ctx)
 	if err != nil {
 		if isDockerUnavailable(err) {
-			t.Skipf("docker unavailable, skipping testcontainers test: %v", err)
+			SkipOrFail(t, "docker unavailable, skipping testcontainers test: %v", err)
 		}
 		t.Fatalf("network.New: %v", err)
 	}

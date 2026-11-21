@@ -46,7 +46,7 @@ jobs:
           go-version-file: go.mod
 
       - name: Run unit tests
-        run: go test -race -count=1 ./internal/...
+        run: go test -race -count=1 ./internal/... ./cmd/...
 
   integration:
     name: Integration
@@ -58,5 +58,38 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # The DuckDB oracles and the real-writer tests need these. ubuntu-latest
+      # ships no duckdb, and the oracles used to skip here without saying so.
+      - name: Install test writers
+        shell: bash
+        run: test/tools/install-test-tools.sh "$RUNNER_TEMP/test-tools" | sed -E "s/^export ([^=]+)='(.*)'$/\1=\2/" >> "$GITHUB_ENV"
+
+      # CI=true makes a missing tool a failure rather than a skip (see
+      # test/harness/required.go). BERGREBASE_NIGHTLY runs the slower scenarios
+      # too; there is no separate nightly workflow.
       - name: Run testcontainers integration tests
-        run: go test -race -count=1 -timeout=20m ./test/...
+        shell: bash
+        env:
+          BERGREBASE_NIGHTLY: "1"
+        run: go test -race -count=1 -timeout=40m -json ./test/... | tee "$RUNNER_TEMP/test-events.jsonl" | jq -r 'select(.Output) | .Output'
+
+      # A skip reports the same green as a pass, so none is allowed, wherever it
+      # came from (a new t.Skip, -short, a harness path). The second check catches
+      # the other way to run nothing: the oracles disappearing altogether.
+      - name: Refuse skipped tests
+        shell: bash
+        run: |
+          events="$RUNNER_TEMP/test-events.jsonl"
+          skipped=$(jq -r 'select(.Action == "skip" and .Test != null) | .Test' "$events")
+          if [[ -n "$skipped" ]]; then
+            echo "::error::tests skipped in CI:"
+            echo "$skipped"
+            exit 1
+          fi
+          oracles=$(jq -r 'select(.Action == "pass" and (.Test // "" | test("^TestDuckDBOracle_[^/]*$"))) | .Test' "$events" | wc -l)
+          writers=$(jq -r 'select(.Action == "pass" and (.Test // "" | test("^TestRealWriters_[^/]*$"))) | .Test' "$events" | wc -l)
+          echo "passed: $oracles DuckDB oracle tests, $writers real-writer tests"
+          if (( oracles < 8 || writers < 9 )); then
+            echo "::error::expected at least 8 oracle and 9 real-writer tests to pass"
+            exit 1
+          fi

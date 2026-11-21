@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -47,9 +48,11 @@ func TestMigrateOne_E2E_Lakekeeper(t *testing.T) {
 
 	// Sanity check: the catalog client can load the table at its
 	// original metadata-location.
+	transport := &dropCountingTransport{wrapped: http.DefaultTransport}
 	cat := rest.New(rest.Config{
-		URI:       s.Lakekeeper.BaseURI,
-		Warehouse: s.Lakekeeper.Warehouse,
+		URI:        s.Lakekeeper.BaseURI,
+		Warehouse:  s.Lakekeeper.Warehouse,
+		HTTPClient: &http.Client{Transport: transport},
 	})
 	id := catalog.Identifier{Namespace: ns, Name: tableName}
 	tbl, err := cat.LoadTable(ctx, id)
@@ -108,6 +111,9 @@ func TestMigrateOne_E2E_Lakekeeper(t *testing.T) {
 	if err := cat.SwapMetadataLocation(ctx, id, tbl.MetadataLocation, res.NewMetadataLocation); err != nil {
 		t.Fatalf("SwapMetadataLocation: %v", err)
 	}
+	if transport.drops != 0 {
+		t.Errorf("swap issued %d DELETE(s); want the single-call register-with-overwrite path", transport.drops)
+	}
 
 	// After swap: the catalog returns the new location.
 	reloaded, err := cat.LoadTable(ctx, id)
@@ -120,7 +126,7 @@ func TestMigrateOne_E2E_Lakekeeper(t *testing.T) {
 
 	// And post-swap validation passes — the data file lives at the new
 	// path (we copied it above) and the metadata graph hangs together.
-	if err := rewrite.ValidateAfterSwap(ctx, store, wantNewLoc); err != nil {
+	if err := rewrite.ValidateAfterSwap(ctx, store, wantNewLoc, eng.Opts.Mapping); err != nil {
 		t.Errorf("ValidateAfterSwap: %v", err)
 	}
 }

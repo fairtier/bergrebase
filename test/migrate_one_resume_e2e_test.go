@@ -209,7 +209,7 @@ func TestMigrateOne_E2E_ResumeAfterSIGKILL(t *testing.T) {
 	if reloaded.MetadataLocation != wantNewLoc {
 		t.Errorf("phase 2: post-resume pointer: have %q, want %q", reloaded.MetadataLocation, wantNewLoc)
 	}
-	if err := rewrite.ValidateAfterSwap(ctx, store, wantNewLoc); err != nil {
+	if err := rewrite.ValidateAfterSwap(ctx, store, wantNewLoc, rewrite.PrefixMapping{Source: srcPrefix, Target: tgtPrefix}); err != nil {
 		t.Errorf("phase 2: ValidateAfterSwap: %v", err)
 	}
 }

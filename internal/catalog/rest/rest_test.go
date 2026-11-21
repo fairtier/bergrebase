@@ -396,6 +396,10 @@ func TestClient_SwapMetadataLocation_AtomicHappyPath(t *testing.T) {
 	if regCall.Query != "overwrite=true" {
 		t.Errorf("register query = %q, want overwrite=true", regCall.Query)
 	}
+	// Lakekeeper reads overwrite from the body only.
+	if !strings.Contains(regCall.Body, `"overwrite":true`) {
+		t.Errorf("register body = %s, want \"overwrite\":true", regCall.Body)
+	}
 }
 
 // TestClient_SwapMetadataLocation_FallbackOnAlreadyExists verifies that

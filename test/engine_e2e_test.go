@@ -157,7 +157,7 @@ func TestEngine_E2E_MinIO(t *testing.T) {
 		// Acceptance criterion #8: post-swap storage-side validation.
 		// With the data file present in target (byte-copied above), the
 		// rewritten metadata graph reaches a HEAD-able URI.
-		if err := rewrite.ValidateAfterSwap(ctx, store, res.NewMetadataLocation); err != nil {
+		if err := rewrite.ValidateAfterSwap(ctx, store, res.NewMetadataLocation, eng.Opts.Mapping); err != nil {
 			t.Errorf("ValidateAfterSwap: %v", err)
 		}
 	})
@@ -185,7 +185,7 @@ func TestEngine_E2E_MinIO(t *testing.T) {
 			t.Fatalf("RewriteTable: %v", err)
 		}
 
-		err = rewrite.ValidateAfterSwap(ctx, store, res.NewMetadataLocation)
+		err = rewrite.ValidateAfterSwap(ctx, store, res.NewMetadataLocation, eng.Opts.Mapping)
 		if !errors.Is(err, rewrite.ErrValidationFailed) {
 			t.Fatalf("expected ErrValidationFailed, got %v", err)
 		}

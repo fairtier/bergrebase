@@ -34,9 +34,8 @@ import (
 // scenario 2 where each snapshot's list grows. m2's exclusion of m1
 // is the load-bearing structural difference.
 //
-// V2 position-delete files and V3 deletion vectors — the other
-// "deletes" mechanisms — are explicitly refused by RewriteManifest;
-// status-based CoW (this test) is the supported path in v1.0.
+// This fixture has no DELETED-status entries. Those are covered against
+// real pyiceberg-written tables in real_writers_e2e_test.go.
 func TestDuckDBOracle_CoW(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping testcontainers test in short mode")

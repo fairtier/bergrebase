@@ -46,27 +46,44 @@ clear error rather than producing a half-rebased table.
 
 ### Catalogs
 
-| Catalog                                 | Status                      |
-|-----------------------------------------|-----------------------------|
-| Lakekeeper (REST)                       | ✅ supported                 |
-| Apache Polaris (REST)                   | ✅ supported                 |
-| Tabular / Snowflake Open Catalog (REST) | ✅ supported                 |
-| AWS Glue REST shim                      | ✅ supported                 |
-| Nessie (REST)                           | best-effort, untested in CI |
+| Catalog                                 | Status                                          |
+|-----------------------------------------|-------------------------------------------------|
+| Lakekeeper (REST)                       | ✅ tested in CI, with real writers (v0.12.4)     |
+| Apache Polaris (REST)                   | ✅ tested in CI, with hand-built fixtures only   |
+| Tabular / Snowflake Open Catalog (REST) | speaks the same REST API; untested              |
+| AWS Glue REST shim                      | speaks the same REST API; untested              |
+| Nessie (REST)                           | best-effort, untested in CI                     |
 | Hive Metastore (Thrift)                 | 🚧 v1.2 — native client     |
 | AWS Glue (native)                       | 🚧 v1.2                     |
 | JDBC catalog                            | 🚧 v1.2                     |
 
-The REST client auto-detects whether the server supports atomic
-`register?overwrite=true`; on older servers it falls back to
-`DropTable(purge=false)` + `RegisterTable`.
+The REST client first tries a single-call `register` with `overwrite`
+(sent in both the query and the body), which swaps the pointer atomically on
+catalogs that honour it; Lakekeeper v0.12.4 does. Otherwise it falls back to
+`DropTable(purge=false)` + `RegisterTable`, which is **not atomic**: for one
+round-trip the table is unregistered, and a process death in between leaves it
+so. Polaris 1.4.0 takes this fallback. `bergrb` logs a warning when it does.
+
+### Writers
+
+CI writes real tables through a real Lakekeeper with these, rebases them with
+the real binary, deletes the originals, and compares every row, snapshot ID and
+time-travel count through DuckDB and pyiceberg:
+
+| Writer                      | Empty | Inserts | Deletes, updates, merges | Partitioned | V3 without deletes | V3 with deletes |
+|-----------------------------|-------|---------|--------------------------|-------------|--------------------|-----------------|
+| DuckDB 1.5.4, 1.5.6, 2.0.0  | ✅     | ✅       | ✅                        | ✅           | ✅                  | ⛔ refused       |
+| pyiceberg 0.12.0            | ✅     | ✅       | ✅                        | ✅           | not tested         | not tested      |
+
+Tables from other writers, Spark and Trino among them, are expected to work but
+are not tested here. Rehearse on a copy and compare the results.
 
 ### Storage
 
-Anything S3-compatible via `aws-sdk-go-v2` with endpoint override: AWS S3,
-Cloudflare R2, MinIO, Backblaze B2, Wasabi, DigitalOcean Spaces, Linode
-Object Storage, Scaleway, OVHcloud. GCS and Azure Blob are out of scope for
-v1.0.
+Anything S3-compatible via `aws-sdk-go-v2` with endpoint override should work:
+AWS S3, Cloudflare R2, MinIO, Backblaze B2, Wasabi, DigitalOcean Spaces, Linode
+Object Storage, Scaleway, OVHcloud. Only a MinIO-compatible server (Silo) is
+exercised by the test suite. GCS and Azure Blob are out of scope for v1.0.
 
 ## Usage
 
@@ -151,13 +168,15 @@ that *isn't* a path.
    (just under the new prefix). Re-running the same command is a no-op for
    files already present, which means partial runs and SIGKILLs resume
    cleanly.
-7. **Atomic catalog swap.** Prefer `register?overwrite=true`; fall back to
-   `DropTable(purge=false)` + `RegisterTable` on older catalogs. On
-   register failure, roll the catalog pointer back to the old metadata
-   location so reads keep working.
+7. **Catalog swap.** Prefer a single `register` with `overwrite` (atomic
+   where the catalog honours it); otherwise `DropTable(purge=false)` +
+   `RegisterTable`, which is not atomic. On register failure, roll the
+   catalog pointer back to the old metadata location so reads keep working.
 8. **Validate.** `LoadTable` post-swap, confirm the snapshot ID matches,
-   and `HEAD` one data file URI from the latest manifest to confirm the
-   target bucket is reachable. `--no-validate` skips this.
+   `HEAD` every live data and delete file of the current snapshot on the
+   target, and refuse if any metadata, manifest-list or manifest URI reachable
+   from the new `metadata.json` still names the source prefix (the sign of a
+   source re-copied over the rewritten files). `--no-validate` skips this.
 
 ### Footguns we avoid
 
@@ -177,13 +196,16 @@ that *isn't* a path.
 ### Validation is best-effort
 
 The post-rebase check confirms the catalog now serves the new
-`metadata.json` (matching snapshot ID) and that one data file URI in the
-latest manifest is reachable in the target bucket. It does **not** re-read
+`metadata.json` (matching snapshot ID), that every live data and delete file
+of the current snapshot exists in the target bucket, and that no metadata URI
+reachable from it still points at the source prefix. It checks presence, not
+content: a truncated object passes. It runs after the swap; see
+[what to do if it fails](./docs/migration-recipes.md#if-validation-fails-after-the-swap). It does **not** re-read
 every data file footer or compare per-column statistics. Full
 correctness verification belongs to your data pipeline (e.g.
-`SELECT count(*)` and checksum comparisons against the pre-rebase table)
-and to the test harness in this repo, which exercises that against
-DuckDB.
+`SELECT count(*)` and checksum comparisons against the pre-rebase table);
+the test harness in this repo does that against DuckDB and pyiceberg, but it
+can only speak for the writers and catalogs it runs.
 
 ### Concurrent writers must be paused
 
@@ -198,9 +220,10 @@ caller's responsibility — bergrebase doesn't take catalog locks.
 - V2 position-delete Parquet bodies rewritten in-place
   (`file_path` column substituted via `arrow-go`); equality-delete
   bodies pass through unchanged because they hold no embedded URIs.
-- REST catalog client with atomic `register?overwrite=true` and a
-  `DropTable + RegisterTable` fallback. Auto-detects which the server
-  supports; rolls back on register failure.
+- REST catalog client with single-call register-with-overwrite (atomic;
+  Lakekeeper) and a non-atomic `DropTable + RegisterTable` fallback
+  (Polaris 1.4.0). Auto-detects which the server supports; rolls back on
+  register failure.
 - S3-compatible storage via `aws-sdk-go-v2` with endpoint, region, and
   path-style overrides (works against AWS S3, R2, MinIO, etc.).
 - CLI with `--dry-run`, `--all-tables` / `--table`,
@@ -210,7 +233,8 @@ caller's responsibility — bergrebase doesn't take catalog locks.
 - Explicit refusal (`ErrUnsupportedFeature`) for V3 deletion vectors
   — never produces a half-rebased table.
 - Testcontainers harness covering merge-gate scenarios across
-  Lakekeeper + Polaris + MinIO + DuckDB.
+  Lakekeeper + Polaris + an S3-compatible server, with real DuckDB and
+  pyiceberg writers against Lakekeeper.
 
 ## Deferred to v1.1
 
@@ -232,12 +256,17 @@ caller's responsibility — bergrebase doesn't take catalog locks.
 
 - `iceberg-go` is at v0.x; minor-version bumps may require coordinated
   updates here.
-- Lakekeeper register-with-overwrite auto-detection is heuristic
-  (capability advertisement varies across server versions).
-- A SIGKILL between `DropTable` and `RegisterTable` on the fallback path
-  leaves the catalog with no entry for the table. The data files and
-  rewritten `metadata.json` survive intact in the target bucket; manual
-  re-registration is required. The atomic-swap path is unaffected.
+- Lakekeeper will not change a warehouse's bucket over its API, so a bucket
+  move means editing its Postgres row first; see
+  [`docs/migration-recipes.md`](./docs/migration-recipes.md).
+- Register-with-overwrite auto-detection is heuristic (capability
+  advertisement varies across servers and versions).
+- On the drop+register fallback (Polaris 1.4.0, and any catalog that does
+  not honour `overwrite`) the swap is not atomic. A SIGKILL between
+  `DropTable` and `RegisterTable` leaves the catalog with no entry for the
+  table. The data files and rewritten `metadata.json` survive intact in the
+  target bucket; manual re-registration is required. The single-call path is
+  unaffected.
 
 ## Building
 

@@ -10,14 +10,16 @@
 //   - GET    /v1/{prefix}/namespaces/{ns}/tables                    (ListTables)
 //   - GET    /v1/{prefix}/namespaces/{ns}/tables/{table}            (LoadTable)
 //   - DELETE /v1/{prefix}/namespaces/{ns}/tables/{table}            (DropTable)
-//   - POST   /v1/{prefix}/namespaces/{ns}/register?overwrite=true   (atomic; auto-detected)
+//   - POST   /v1/{prefix}/namespaces/{ns}/register?overwrite=true   (atomic where honoured; auto-detected)
 //   - POST   /v1/{prefix}/namespaces/{ns}/register                  (fallback)
 //   - GET    /v1/config                                             (warehouse prefix)
 //
-// Atomic-swap strategy: prefer single-call register-with-overwrite when
-// the catalog supports it (Polaris, recent Lakekeeper); auto-detect on
-// the first swap and fall back to drop-without-purge + register
-// otherwise. iceberg-go's full REST catalog ships its own client, but it
+// Swap strategy: prefer single-call register-with-overwrite, which is
+// atomic, when the catalog honours it (Lakekeeper v0.12.4, which reads
+// `overwrite` from the body only); auto-detect on the first swap and fall
+// back to drop-without-purge + register otherwise (Polaris 1.4.0). The
+// fallback is NOT atomic: the table is unregistered between the two
+// calls. iceberg-go's full REST catalog ships its own client, but it
 // transitively pulls in arrow-go + parquet + substrait + grpc;
 // bergrebase keeps its dependency surface small by speaking the REST
 // protocol directly.
@@ -30,6 +32,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"path"
@@ -330,8 +333,8 @@ func (c *Client) LoadTable(ctx context.Context, id catalog.Identifier) (*catalog
 // will pick up the new metadata, walk it, and try the swap again.
 var ErrCatalogDrift = errors.New("rest: catalog drifted since LoadTable; concurrent writer committed")
 
-// SwapMetadataLocation atomically re-points id from oldLocation to
-// newLocation. It prefers a single-call register?overwrite=true when the
+// SwapMetadataLocation re-points id from oldLocation to newLocation.
+// It is atomic only on the single-call path. It prefers a single-call register?overwrite=true when the
 // catalog supports it (auto-detected on first invocation; cached
 // thereafter); otherwise falls back to drop-without-purge + register, in
 // which case a register failure best-effort re-registers oldLocation so
@@ -418,6 +421,9 @@ func (c *Client) swapByDropRegister(ctx context.Context, id catalog.Identifier, 
 	swapCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Minute)
 	defer cancel()
 
+	slog.Warn("catalog did not honour register-with-overwrite; swapping by drop + register, which is NOT atomic",
+		"table", qualifiedName(id), "new", newLocation)
+
 	if err := c.dropTable(swapCtx, id); err != nil {
 		return fmt.Errorf("rest: drop %s: %w", qualifiedName(id), err)
 	}
@@ -450,12 +456,17 @@ func (c *Client) registerTable(ctx context.Context, id catalog.Identifier, metad
 		q.Set("overwrite", "true")
 		u.RawQuery = q.Encode()
 	}
+	// overwrite goes in the body as well as the query: the REST spec's
+	// RegisterTableRequest carries it as a field, and Lakekeeper v0.12.4
+	// reads only the body, answering 409 to the query parameter alone.
 	body := struct {
 		Name             string `json:"name"`
 		MetadataLocation string `json:"metadata-location"`
+		Overwrite        bool   `json:"overwrite,omitempty"`
 	}{
 		Name:             id.Name,
 		MetadataLocation: metadataLoc,
+		Overwrite:        overwrite,
 	}
 	return c.do(ctx, http.MethodPost, u, body, nil)
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 
 	iceberg "github.com/apache/iceberg-go"
@@ -122,6 +123,7 @@ func (e *Engine) RewriteTable(ctx context.Context, oldMetadataLocation string) (
 	}
 
 	res.Hits = append(res.Hits, WalkMetadataJSON(meta, e.Opts.Mapping)...)
+	manifests := manifestMemo{}
 
 	for _, snap := range selectSnapshots(meta, e.Opts.CurrentSnapshotOnly) {
 		if snap.ManifestList != "" {
@@ -130,6 +132,10 @@ func (e *Engine) RewriteTable(ctx context.Context, oldMetadataLocation string) (
 				return res, err
 			}
 			res.Hits = append(res.Hits, listHits...)
+			hdr, version, err = resolveManifestListHeader(hdr, version, snap, meta.FormatVersion, files)
+			if err != nil {
+				return res, fmt.Errorf("manifest list %s: %w", snap.ManifestList, err)
+			}
 
 			rewrittenFiles := make([]iceberg.ManifestFile, 0, len(files))
 			subtreeChanged := false
@@ -140,8 +146,9 @@ func (e *Engine) RewriteTable(ctx context.Context, oldMetadataLocation string) (
 						return res, err
 					}
 					res.Hits = append(res.Hits, mfHits...)
+					subtreeChanged = subtreeChanged || slices.ContainsFunc(mfHits, PathHit.Rewritten)
 				} else {
-					newMF, mfHits, err := RewriteManifest(ctx, e.Source, e.Target, mf, e.Opts.Mapping)
+					newMF, mfHits, err := manifests.rewrite(ctx, e.Source, e.Target, mf, e.Opts.Mapping)
 					if err != nil {
 						return res, err
 					}
@@ -164,14 +171,14 @@ func (e *Engine) RewriteTable(ctx context.Context, oldMetadataLocation string) (
 			// Skip the write when (a) every inner manifest came back
 			// unchanged AND (b) the list URI itself is out-of-prefix.
 			listURIChanged := e.Opts.Mapping.Apply(snap.ManifestList) != snap.ManifestList
+			// Same refusal as RewriteManifest's: a list whose own URI
+			// is out-of-prefix would be overwritten at its ORIGINAL
+			// location, mutating the live source table pre-swap.
+			if subtreeChanged && !e.Opts.Mapping.Matches(snap.ManifestList) {
+				return res, fmt.Errorf("%w: manifest list %s is outside source prefix %q but its manifests changed",
+					ErrOutsidePrefix, snap.ManifestList, e.Opts.Mapping.Source)
+			}
 			if !e.Opts.DryRun && (subtreeChanged || listURIChanged) {
-				// Same refusal as RewriteManifest's: a list whose own URI
-				// is out-of-prefix would be overwritten at its ORIGINAL
-				// location, mutating the live source table pre-swap.
-				if subtreeChanged && !e.Opts.Mapping.Matches(snap.ManifestList) {
-					return res, fmt.Errorf("%w: manifest list %s is outside source prefix %q but its manifests changed",
-						ErrOutsidePrefix, snap.ManifestList, e.Opts.Mapping.Source)
-				}
 				if _, err := RewriteManifestList(ctx, e.Target, snap.ManifestList, e.Opts.Mapping, version, hdr, rewrittenFiles); err != nil {
 					return res, err
 				}
@@ -196,7 +203,7 @@ func (e *Engine) RewriteTable(ctx context.Context, oldMetadataLocation string) (
 				}
 				res.Hits = append(res.Hits, mfHits...)
 			} else {
-				newMF, mfHits, err := RewriteManifest(ctx, e.Source, e.Target, mf, e.Opts.Mapping)
+				newMF, mfHits, err := manifests.rewrite(ctx, e.Source, e.Target, mf, e.Opts.Mapping)
 				if err != nil {
 					return res, err
 				}
@@ -236,6 +243,64 @@ func (e *Engine) RewriteTable(ctx context.Context, oldMetadataLocation string) (
 		}
 	}
 	return res, nil
+}
+
+// resolveManifestListHeader completes what a manifest list's OCF header left
+// out. The spec does not require those keys on a list and DuckDB omits all of
+// them, so metadata.json is the authority for snapshot identity, and the
+// version falls back to what iceberg-go inferred from the list's Avro schema
+// (a v2-era list stays v2 in a table upgraded to v3), then to the table's.
+//
+// A header that contradicts metadata.json is an error rather than a tie-break:
+// one of the two is corrupt and rewriting would hide it. So is a v3 list whose
+// row lineage cannot be carried over, because iceberg-go's writer would invent
+// first_row_id values for it.
+func resolveManifestListHeader(hdr ManifestListHeader, version int, snap SnapshotJSON, tableVersion int, files []iceberg.ManifestFile) (ManifestListHeader, int, error) {
+	if version == 0 {
+		version = tableVersion
+		if len(files) > 0 {
+			version = files[0].Version()
+		}
+	}
+	id := snap.SnapshotID
+	if hdr.SnapshotID != nil && *hdr.SnapshotID != id {
+		return hdr, 0, fmt.Errorf("OCF header snapshot-id %d contradicts metadata.json snapshot %d", *hdr.SnapshotID, id)
+	}
+	hdr.SnapshotID = &id
+	var err error
+	if hdr.ParentSnapshotID, err = reconcileHeaderField("parent-snapshot-id", hdr.ParentSnapshotID, snap.ParentSnapshotID); err != nil {
+		return hdr, 0, err
+	}
+	if hdr.SequenceNumber, err = reconcileHeaderField("sequence-number", hdr.SequenceNumber, snap.SequenceNumber); err != nil {
+		return hdr, 0, err
+	}
+	if hdr.FirstRowID, err = reconcileHeaderField("first-row-id", hdr.FirstRowID, snap.FirstRowID); err != nil {
+		return hdr, 0, err
+	}
+	if version >= 3 {
+		if hdr.FirstRowID == nil {
+			return hdr, 0, fmt.Errorf("%w: V3 snapshot %d has no first-row-id; row lineage cannot be preserved", ErrUnsupportedFeature, id)
+		}
+		for _, mf := range files {
+			if mf.ManifestContent() == iceberg.ManifestContentData && mf.FirstRowID() == nil {
+				return hdr, 0, fmt.Errorf("%w: V3 data manifest %s has no first_row_id; row lineage cannot be preserved", ErrUnsupportedFeature, mf.FilePath())
+			}
+		}
+	}
+	return hdr, version, nil
+}
+
+// reconcileHeaderField returns the value of a field that may be in the OCF
+// header, in metadata.json, or in both, and errors if the two disagree.
+func reconcileHeaderField(name string, header, meta *int64) (*int64, error) {
+	switch {
+	case header == nil:
+		return meta, nil
+	case meta != nil && *header != *meta:
+		return nil, fmt.Errorf("OCF header %s %d contradicts metadata.json value %d", name, *header, *meta)
+	default:
+		return header, nil
+	}
 }
 
 // selectSnapshots returns the snapshot set the rewriter should walk.

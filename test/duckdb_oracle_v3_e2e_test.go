@@ -125,10 +125,10 @@ func TestDuckDBOracle_V3_RowLineage(t *testing.T) {
 	// gap is upstream.
 	pre := tryQueryIcebergScan(t, mi, metaURI)
 	if pre == nil {
-		t.Skipf("DuckDB iceberg_scan does not yet support V3 row lineage on this version; skipping V3 oracle")
+		harness.SkipOrFail(t, "DuckDB iceberg_scan does not yet support V3 row lineage on this version; skipping V3 oracle")
 	}
 	if pre.Count != rowCount || pre.SumID != sumID {
-		t.Skipf("DuckDB returned %+v on V3 fixture (expected count=%d sum=%d); treating as upstream V3 support gap, not a bergrebase regression",
+		harness.SkipOrFail(t, "DuckDB returned %+v on V3 fixture (expected count=%d sum=%d); treating as upstream V3 support gap, not a bergrebase regression",
 			*pre, rowCount, sumID)
 	}
 

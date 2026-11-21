@@ -14,6 +14,11 @@ equality-delete file rewrite both ship in v1.0
 column rewrite ; equality-deletes need no body rewrite because the file
 contains only the projected equality column values).
 
+Real tables are not like the hand-built seeds in `test/harness/seed.go`:
+gzipped metadata, manifest lists with no OCF keys, 63-bit snapshot IDs, DELETED
+entries. Anything touching the rewrite path needs `test/real_writers_e2e_test.go`
+green, and CI fails on any skipped test.
+
 Treat new work as either (a) closing roadmap follow-ups or (b) the V3
 DV work. The public surfaces (`Catalog`, `Storage`, `rewrite.Engine`)
 are stable; redesigning them needs a real reason.
@@ -23,7 +28,8 @@ are stable; redesigning them needs a real reason.
 ```bash
 go build -o bergrb ./cmd/bergrb        # build the CLI
 go test ./...                          # all unit tests (rewrite, storage, catalog/rest)
-go test ./test/...                     # testcontainers harness (Lakekeeper + Polaris + MinIO)
+go test ./test/...                     # testcontainers harness (Lakekeeper + Polaris + Silo); real-writer tests need the tools below
+eval "$(test/tools/install-test-tools.sh ~/.cache/bergrebase-test-tools)"  # DuckDB CLIs (checksummed) + pyiceberg (versions pinned, transitive deps not)
 go test ./internal/rewrite -run TestPrefixMapping_Apply  # single test
 docker build -t bergrebase:dev .       # static distroless image, ENTRYPOINT=/bin/bergrb
 ```
@@ -44,8 +50,8 @@ binary:
   `SwapMetadataLocation`).
 - `internal/catalog` — three-method swap surface (`ListTables`, `LoadTable`,
   `SwapMetadataLocation`). Sub-package `rest/` is the only planned v1
-  implementation; it covers Lakekeeper, Polaris, Tabular, Snowflake Open
-  Catalog, and Glue's REST shim.
+  implementation; it is tested against Lakekeeper and Polaris, and should
+  also fit Tabular, Snowflake Open Catalog, and Glue's REST shim (untested).
 - `internal/storage` — minimal S3 surface (`GetObject`, `PutObject`,
   `HeadObject`) over `aws-sdk-go-v2` with endpoint override (works against R2,
   MinIO, B2, etc.). `s3://bucket/key` URI parsing lives here.
@@ -87,12 +93,22 @@ changing rewrite logic.
    position-delete `.parquet` files (supported) from V3 `.puffin`
    (refused). `--keep-going` may demote per-table failures to logs at
    the CLI layer, but the engine itself fails closed.
-6. **Catalog swap is the last step and must be atomic.** The engine
-   returns the new metadata location; only then does `cmd/bergrb`
-   call `SwapMetadataLocation`. The REST implementation prefers
-   `register?overwrite=true` and falls back to `DropTable(purge=false)`
-   + `RegisterTable`; on register failure it must roll back to the
-   old pointer so reads keep working.
+6. **Preserve everything that is not a path.** Entry status, snapshot IDs,
+   sequence numbers and `first_row_id` must come out as they went in. A
+   DELETED entry rewritten as ADDED resurrects its rows; a snapshot ID through
+   float64 changes. If something cannot be preserved, refuse. One explicit
+   exception: `referenced_data_file` on a V2 manifest is dropped, because
+   iceberg-go's v2 schema has no field 143. Refusing would block every V2 table
+   with it, DuckDB 2.0's included, and readers fall back to the delete file's
+   own `file_path` column.
+7. **Catalog swap is the last step.** The engine returns the new
+   metadata location; only then does `cmd/bergrb` call
+   `SwapMetadataLocation`. The REST implementation prefers a single
+   `register` with `overwrite` (query and body; atomic, Lakekeeper
+   v0.12.4) and falls back to `DropTable(purge=false)` + `RegisterTable`,
+   which is **not atomic** (Polaris 1.4.0); on register failure it must
+   roll back to the old pointer so reads keep working. Do not describe
+   the swap as atomic without naming the path.
 
 ### Iceberg version scope (v1)
 
@@ -118,7 +134,7 @@ package doc-comments, not just the code:
 - `internal/rewrite/walker.go` — top-level rewrite driver and the
   bottom-up walk order.
 - `internal/catalog/rest/rest.go` — REST swap strategy
-  (`register?overwrite=true` with drop+register fallback).
+  (register-with-overwrite with a non-atomic drop+register fallback).
 - `README.md` — public-facing usage, coverage matrix, and the
   algorithm overview.
 - `docs/migration-recipes.md` — user-facing runbooks for the four

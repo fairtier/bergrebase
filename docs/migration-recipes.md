@@ -27,13 +27,60 @@ All four recipes assume:
   to S3 directly — it does not use catalog-vended credentials.
 - **Tables are V1, V2 (any delete shape), or V3 without deletion
   vectors.** V3 DV tables are refused with `ErrUnsupportedFeature`
-  until the Puffin rewrite lands ([`puffin.md`](./puffin.md)). Inventory
-  tables before you start; `--keep-going` only demotes per-table
-  failures to logs.
-- **Target catalog supports atomic `register?overwrite=true`** (recent
-  Lakekeeper, current Polaris). Older Lakekeeper falls back to
-  `DropTable(purge=false)` + `RegisterTable`, which has a documented
-  process-death window — see [`design.md` D2](./design.md).
+  until the Puffin rewrite lands ([`puffin.md`](./puffin.md)). DuckDB
+  writes deletes on a V3 table as deletion vectors, so such a table is
+  refused. Inventory tables before you start: `--dry-run` applies the same
+  refusals as a live run, but it writes nothing, so storage failures and
+  anything only the catalog can reject appear only live. `--keep-going` only
+  demotes per-table failures to logs.
+- **Verify the result yourself.** `bergrb`'s built-in validation checks
+  the catalog pointer, the snapshot ID, that every live data and delete file
+  of the current snapshot exists on the target, and that no metadata URI
+  still names the source prefix — also when a re-run finds the table already
+  migrated. It checks presence, not content, and older snapshots' files are
+  not checked, so it is not proof of a complete copy.
+  Compare row counts and checksums before and after, before you delete the
+  source bucket.
+
+## If validation fails after the swap
+
+Validation runs after the catalog swap, so on a validation failure the table
+**already points at the target**, and `bergrb` does not undo that. The usual
+cause is an incomplete byte copy, and readers of that table will now fail. Do
+not delete the source. A re-run keeps exiting non-zero while the check fails
+(unless you pass `--no-validate`). Then either:
+
+- **Finish the copy and run `bergrb` again.** Copy **only the missing objects**
+  (`rclone copy --ignore-existing`). A plain re-copy overwrites the rewritten
+  metadata at the target with the originals, and those name the source;
+  validation then fails on the source-prefix URIs. A re-run alone does not
+  repair that (the catalog already points at the target, so `bergrb` only
+  validates): swap back to the source as below, then run `bergrb` again,
+  which rewrites the metadata at the target. With the missing objects in
+  place the same command exits 0.
+- **Swap back to the source**, using the `old` metadata location from the run's
+  `metadata rewritten` log line, or the current location with the prefixes
+  exchanged:
+
+  ```http
+  POST /v1/{prefix}/namespaces/{ns}/register?overwrite=true
+  Content-Type: application/json
+
+  {"name": "{table-name}", "metadata-location": "s3://old-bucket/.../00002-….metadata.json", "overwrite": true}
+  ```
+
+  Lakekeeper v0.12.4 needs `overwrite` in the body as shown and answers 409 to
+  the query parameter alone; other catalogs may differ. On Lakekeeper that location has to be inside the warehouse's bucket, so after
+  a Postgres bucket edit, revert the edit first. Writers must still be paused:
+  a commit made on the target is lost by swapping back.
+
+`TestRealWriters_IncompleteCopy` runs both, within one bucket.
+- **Know which swap your catalog gets.** Lakekeeper v0.12.4 honours
+  register-with-overwrite, so the swap is one atomic call. Polaris 1.4.0 does
+  not: `bergrb` falls back to `DropTable(purge=false)` + `RegisterTable`, which
+  is **not atomic** and has a process-death window in which the table is
+  unregistered — see [`design.md` D2](./design.md). `bergrb` logs a warning
+  when it takes the fallback. Other catalogs are untested.
 
 ## 1. Same catalog, new bucket
 
@@ -47,9 +94,12 @@ storage location changes. This is what `bergrebase` was designed for.
    Keys must be preserved 1:1 — `bergrebase` rewrites under a strict
    prefix substitution and does not handle key remapping.
 3. **Update the catalog's storage configuration** to point at the new
-   bucket (variant-specific, see below). Order vs. step 4 doesn't
-   matter — `bergrebase` authenticates to S3 directly — but both must
-   be done before clients come back online.
+   bucket (variant-specific, see below). **Do this before step 4.**
+   `bergrebase` reads and writes S3 with its own credentials, but its
+   last step registers the table at the new location, and the catalog
+   checks that location against its storage configuration. Lakekeeper
+   answers 400 if it is outside the warehouse's bucket; `bergrb` then
+   rolls back and exits non-zero, and the table stays on the old bucket.
 4. Run `bergrb` with the prefix mapping.
 5. Validate (default; skip with `--no-validate`).
 6. Resume writers; decommission the source bucket once you're satisfied.
@@ -74,17 +124,31 @@ again."
 
 Lakekeeper stores a **storage profile** per warehouse: bucket,
 endpoint, region, path-style flag, plus a reference to a
-**storage-credential** resource. After the byte copy, update the
-profile to point at the new bucket and the credential to one that
-grants access on the new bucket. Use Lakekeeper's management API
-(`/management/v1/warehouse/...` — exact path depends on your
-Lakekeeper version, consult its OpenAPI spec) or update the
-`warehouse` row in Postgres directly if you control the database.
+**storage-credential** resource.
 
-The `storage-credential` referenced by the warehouse is a separate
-resource. Either rotate the credential value to grant the new bucket
-(simplest if you control IAM), or create a new credential and rebind
-the warehouse to it.
+**The bucket has to be changed in Postgres.** Lakekeeper's management
+API refuses it (``400 Field `bucket` cannot be updated``, checked
+against v0.12.4), and a warehouse has exactly one bucket, so there is
+no state in which it covers both. With writers paused and the bytes
+copied, edit the warehouse row, then run `bergrb`:
+
+```sql
+UPDATE warehouse
+   SET storage_profile = jsonb_set(storage_profile, '{bucket}', '"new-bucket"')
+ WHERE warehouse_name = 'my-warehouse';
+```
+
+`TestRealWriters_BucketMove` runs exactly this sequence. **The whole
+warehouse moves at once:** after the edit Lakekeeper will not accept
+new locations in the old bucket, so run `bergrb` with
+`--all-namespaces` and do not reopen writers until every table is
+across. Keep the same `key-prefix` on both sides: it is immutable too.
+
+If the endpoint or credentials also change, update them afterwards
+through the management API (`POST
+/management/v1/warehouse/{id}/storage`, with the profile now naming the
+new bucket). That combination has not been exercised against a real
+second endpoint; test it on a copy first.
 
 ### Polaris variant
 
@@ -187,10 +251,11 @@ the target catalog at their **old-bucket** pointers first, then let
 
 1. Pause writes.
 2. `rclone` source bucket → target bucket.
-3. **Stand up target catalog**, storage configuration pointing at
-   the **new** bucket. `allowed-locations` (Polaris) or storage
-   profile (Lakekeeper) covers both buckets during cutover; trim
-   afterwards.
+3. **Stand up target catalog.** On Polaris, `allowed-locations` covers
+   both buckets during cutover; trim afterwards. On Lakekeeper a
+   warehouse has one bucket, and registering a location outside it is
+   refused, so create the warehouse on the **old** bucket for now and
+   see step 5.
 4. **Recreate namespaces** in the target catalog. If the migration
    is operator-led (e.g. a SaaS provider doing a hand-off), grants /
    principals / roles in the target catalog are typically the
@@ -203,6 +268,11 @@ the target catalog at their **old-bucket** pointers first, then let
    its old-bucket `metadata-location`**. Yes, intentionally — the
    metadata.json contents under the new bucket still reference the
    old bucket too, and `bergrebase` will fix both in step 6.
+   On Lakekeeper, once every table is registered, edit the warehouse
+   row to name the new bucket as in
+   [§1](#lakekeeper-variant). This ordering is verified on a single
+   catalog by `TestRealWriters_BucketMove`; a second catalog instance
+   has not been exercised.
 6. Run `bergrb` against the **target** catalog with
    `--source-prefix s3://old-bucket/...`
    `--target-prefix s3://new-bucket/...`. It loads each table from
@@ -232,7 +302,7 @@ CRUD on the namespaces being migrated**:
 | §3 step 5 (pre-`bergrb` register)               | `POST .../namespaces/{ns}/register` at old-bucket pointer                | create-table on namespace            |
 | `bergrb` `ListTables`                           | `GET .../namespaces/{ns}/tables`                                         | list-tables on namespace             |
 | `bergrb` `LoadTable`                            | `GET .../tables/{name}`                                                  | read-table                           |
-| `bergrb` `SwapMetadataLocation` (atomic path)   | `POST .../register?overwrite=true`                                       | create-table-with-overwrite          |
+| `bergrb` `SwapMetadataLocation` (single call)   | `POST .../register?overwrite=true`                                       | create-table-with-overwrite          |
 | `bergrb` `SwapMetadataLocation` (fallback path) | `DELETE .../tables/{name}?purgeRequested=false` then `POST .../register` | drop-table (no purge) + create-table |
 
 Four permission verbs total: `list-tables`, `read-table`,
@@ -293,7 +363,9 @@ single one-way move.
    to point at the new bucket, new endpoint, and new credentials.
    The dump carried the storage profile *as it was on the source* —
    it points at the source bucket and source credentials and must be
-   rewritten before the target instance is usable.
+   rewritten before the target instance is usable. The bucket can only
+   be changed in Postgres, before step 5: see
+   [§1](#lakekeeper-variant).
 5. Run `bergrb` against the target Lakekeeper with the prefix
    mapping.
 6. Validate.

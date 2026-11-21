@@ -150,7 +150,7 @@ func TestMigrateOne_E2E_V2Wide(t *testing.T) {
 	if reloaded.MetadataLocation != wantNewLoc {
 		t.Errorf("post-rebase pointer: have %q, want %q", reloaded.MetadataLocation, wantNewLoc)
 	}
-	if err := rewrite.ValidateAfterSwap(ctx, store, wantNewLoc); err != nil {
+	if err := rewrite.ValidateAfterSwap(ctx, store, wantNewLoc, eng.Opts.Mapping); err != nil {
 		t.Errorf("ValidateAfterSwap: %v", err)
 	}
 }

@@ -1,9 +1,12 @@
 package rewrite
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 )
 
 // RewriteMetadataJSON reads the metadata.json at oldURI from src,
@@ -20,7 +23,10 @@ import (
 // map[string]any, mutate, re-marshal); on the change path the output
 // is valid Iceberg metadata.json but is not guaranteed to be
 // byte-identical to the input. Iceberg readers parse JSON structurally,
-// so field-order drift is harmless.
+// so field-order drift is harmless. Values other than the path-bearing
+// strings are preserved exactly, numbers included (see decodeMetadataDoc), and
+// a gzipped document is written back gzipped because readers pick the codec
+// from the file name, which the prefix substitution leaves unchanged.
 func RewriteMetadataJSON(ctx context.Context, src, target Storage, oldURI string, mapping PrefixMapping) (string, []PathHit, error) {
 	if !mapping.Matches(oldURI) {
 		return "", nil, fmt.Errorf("metadata location %q does not start with source prefix %q", oldURI, mapping.Source)
@@ -31,8 +37,12 @@ func RewriteMetadataJSON(ctx context.Context, src, target Storage, oldURI string
 		return "", nil, fmt.Errorf("read metadata.json %s: %w", oldURI, err)
 	}
 
-	var doc map[string]any
-	if err := json.Unmarshal(raw, &doc); err != nil {
+	text, gzipped, err := inflateMetadataJSON(raw)
+	if err != nil {
+		return "", nil, fmt.Errorf("read metadata.json %s: %w", oldURI, err)
+	}
+	doc, err := decodeMetadataDoc(text)
+	if err != nil {
 		return "", nil, fmt.Errorf("parse metadata.json %s: %w", oldURI, err)
 	}
 
@@ -45,11 +55,33 @@ func RewriteMetadataJSON(ctx context.Context, src, target Storage, oldURI string
 	if err != nil {
 		return "", nil, fmt.Errorf("marshal metadata.json: %w", err)
 	}
+	if gzipped {
+		if newRaw, err = deflateMetadataJSON(newRaw); err != nil {
+			return "", nil, err
+		}
+	}
 	newURI := mapping.Apply(oldURI)
 	if err := putAndVerify(ctx, target, newURI, newRaw); err != nil {
 		return "", nil, fmt.Errorf("metadata.json %s: %w", newURI, err)
 	}
 	return newURI, hits, nil
+}
+
+// decodeMetadataDoc parses a metadata.json for rewriting. Numbers stay as
+// json.Number because snapshot IDs are random 63-bit values: through float64
+// they lose their low digits, which would silently change every snapshot ID in
+// the document while the manifests keep the original ones.
+func decodeMetadataDoc(text []byte) (map[string]any, error) {
+	dec := json.NewDecoder(bytes.NewReader(text))
+	dec.UseNumber()
+	var doc map[string]any
+	if err := dec.Decode(&doc); err != nil {
+		return nil, err
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return nil, errors.New("trailing data after top-level JSON value")
+	}
+	return doc, nil
 }
 
 // ApplyMetadataJSONMapping mutates every path-bearing field in doc

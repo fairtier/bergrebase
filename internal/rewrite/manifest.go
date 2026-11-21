@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"strconv"
 
 	iceberg "github.com/apache/iceberg-go"
@@ -49,8 +50,10 @@ func WalkManifestList(ctx context.Context, src Storage, uri string, mapping Pref
 // container ourselves with hamba/avro/v2 (already a transitive dep).
 //
 // V1 stores no sequence-number; V3 additionally stores first-row-id.
-// Missing fields return zero values; the writer picks the right
-// constructor based on the format version returned here.
+// Missing fields return zero values, and a missing format-version returns
+// version 0: the spec requires none of these keys on a manifest list and
+// DuckDB writes none of them. resolveManifestListHeader fills the gaps from
+// metadata.json.
 func readManifestListHeader(raw []byte) (ManifestListHeader, int, error) {
 	dec, err := ocf.NewDecoder(bytes.NewReader(raw), ocf.WithDecoderSchemaCache(&avro.SchemaCache{}))
 	if err != nil {
@@ -59,9 +62,12 @@ func readManifestListHeader(raw []byte) (ManifestListHeader, int, error) {
 	defer func() { _ = dec.Close() }()
 
 	meta := dec.Metadata()
-	version, err := strconv.Atoi(string(meta["format-version"]))
-	if err != nil {
-		return ManifestListHeader{}, 0, fmt.Errorf("manifest-list format-version: %w", err)
+	version := 0
+	if v := string(meta["format-version"]); v != "" {
+		version, err = strconv.Atoi(v)
+		if err != nil {
+			return ManifestListHeader{}, 0, fmt.Errorf("manifest-list format-version: %w", err)
+		}
 	}
 	hdr := ManifestListHeader{}
 	if v := string(meta["snapshot-id"]); v != "" && v != "null" {
@@ -69,7 +75,7 @@ func readManifestListHeader(raw []byte) (ManifestListHeader, int, error) {
 		if err != nil {
 			return ManifestListHeader{}, 0, fmt.Errorf("manifest-list snapshot-id: %w", err)
 		}
-		hdr.SnapshotID = n
+		hdr.SnapshotID = &n
 	}
 	if v := string(meta["parent-snapshot-id"]); v != "" && v != "null" {
 		n, err := strconv.ParseInt(v, 10, 64)
@@ -90,7 +96,7 @@ func readManifestListHeader(raw []byte) (ManifestListHeader, int, error) {
 		if err != nil {
 			return ManifestListHeader{}, 0, fmt.Errorf("manifest-list first-row-id: %w", err)
 		}
-		hdr.FirstRowID = n
+		hdr.FirstRowID = &n
 	}
 	return hdr, version, nil
 }
@@ -103,6 +109,8 @@ func readManifestListHeader(raw []byte) (ManifestListHeader, int, error) {
 // Entry routing:
 //   - EntryContentData / EntryContentPosDeletes / EntryContentEqDeletes
 //     → report path hits for file_path and (if set) referenced_data_file.
+//     A referenced_data_file hit with an empty New means the field is
+//     dropped: see minVersionWithReferencedDataFile.
 //   - EntryContentPosDeletes (Parquet, in scope) → additionally read the
 //     delete file's body via WalkPositionDeleteFile so a dry-run
 //     surfaces the same body-level failures (unparseable Parquet,
@@ -117,11 +125,27 @@ func WalkManifest(ctx context.Context, src Storage, mf iceberg.ManifestFile, map
 	if err != nil {
 		return nil, fmt.Errorf("read manifest %s: %w", mf.FilePath(), err)
 	}
+	raw = normalizeDeleteManifestHeader(mf, raw)
+	// The same reads and the same encoder as RewriteManifest, so that a clean dry
+	// run predicts the live run.
+	reader, err := iceberg.NewManifestReader(mf, bytes.NewReader(raw))
+	if err != nil {
+		return nil, fmt.Errorf("decode manifest %s: %w", mf.FilePath(), err)
+	}
+	header, err := manifestHeader(raw)
+	if err != nil {
+		return nil, fmt.Errorf("manifest %s: read header: %w", mf.FilePath(), err)
+	}
+	spec, err := reader.PartitionSpec()
+	if err != nil {
+		return nil, fmt.Errorf("manifest %s: read partition spec: %w", mf.FilePath(), err)
+	}
 	entries, err := iceberg.ReadManifest(mf, bytes.NewReader(raw), false)
 	if err != nil {
 		return nil, fmt.Errorf("decode manifest %s: %w", mf.FilePath(), err)
 	}
 	hits := make([]PathHit, 0, len(entries))
+	changed := false
 	for i, e := range entries {
 		df := e.DataFile()
 		switch df.ContentType() {
@@ -132,6 +156,9 @@ func WalkManifest(ctx context.Context, src Storage, mf iceberg.ManifestFile, map
 				return nil, fmt.Errorf("%w: manifest %s entry %d points at Puffin file %s (V3 deletion vector)",
 					ErrUnsupportedFeature, mf.FilePath(), i, df.FilePath())
 			}
+			if e.Status() == iceberg.EntryStatusDELETED {
+				break // A tombstone's body is never read; see RewriteManifest.
+			}
 			if err := WalkPositionDeleteFile(ctx, src, df.FilePath(), mapping); err != nil {
 				return nil, fmt.Errorf("dry-run position-delete %s: %w", df.FilePath(), err)
 			}
@@ -139,18 +166,38 @@ func WalkManifest(ctx context.Context, src Storage, mf iceberg.ManifestFile, map
 			return nil, fmt.Errorf("%w: manifest %s entry %d has content type %s",
 				ErrUnsupportedFeature, mf.FilePath(), i, df.ContentType())
 		}
-		hits = append(hits, PathHit{
+		fileHit := PathHit{
 			Field: fmt.Sprintf("manifest[%s].entries[%d].data_file.file_path", mf.FilePath(), i),
 			Old:   df.FilePath(),
 			New:   mapping.Apply(df.FilePath()),
-		})
-		if ref := df.ReferencedDataFile(); ref != nil && *ref != "" {
-			hits = append(hits, PathHit{
-				Field: fmt.Sprintf("manifest[%s].entries[%d].data_file.referenced_data_file", mf.FilePath(), i),
-				Old:   *ref,
-				New:   mapping.Apply(*ref),
-			})
 		}
+		hits = append(hits, fileHit)
+		changed = changed || fileHit.Rewritten()
+		if ref := df.ReferencedDataFile(); ref != nil && *ref != "" {
+			refHit := referencedDataFileHit(mf, i, *ref, header.version, mapping)
+			hits = append(hits, refHit)
+			changed = changed || (header.version >= minVersionWithReferencedDataFile && refHit.Rewritten())
+		}
+	}
+	if changed && !mapping.Matches(mf.FilePath()) {
+		return nil, fmt.Errorf("%w: manifest %s is outside source prefix %q but references in-prefix paths; rewriting would overwrite the original in place",
+			ErrOutsidePrefix, mf.FilePath(), mapping.Source)
+	}
+	if !changed {
+		return hits, nil // The live run leaves this manifest alone: nothing to encode.
+	}
+	w, err := iceberg.NewManifestWriter(header.version, io.Discard, *spec, header.schema, mf.SnapshotID(),
+		iceberg.WithManifestWriterContent(mf.ManifestContent()))
+	if err != nil {
+		return nil, fmt.Errorf("encode manifest %s: %w", mf.FilePath(), err)
+	}
+	for _, entry := range entries {
+		if err := addEntryKeepingStatus(w, mf, entry); err != nil {
+			return nil, fmt.Errorf("encode manifest %s: %w", mf.FilePath(), err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		return nil, fmt.Errorf("encode manifest %s: %w", mf.FilePath(), err)
 	}
 	return hits, nil
 }

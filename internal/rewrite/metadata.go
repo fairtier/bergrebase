@@ -55,7 +55,7 @@ var PathFieldsInManifestList = []string{
 // column_sizes, which describe the pre-rewrite byte layout.
 var PathFieldsInManifest = []string{
 	"data_file.file_path",                // id 100 — data/delete/Puffin file URI
-	"data_file.referenced_data_file",     // id 143 — V2+ delete files; V3 mandatory for DVs
+	"data_file.referenced_data_file",     // id 143 — rewritten on V3; DROPPED on V2, see minVersionWithReferencedDataFile
 	"data_file.lower_bounds[2147483546]", // position-delete entries only — file_path column bound
 	"data_file.upper_bounds[2147483546]", // position-delete entries only — file_path column bound
 }

@@ -49,12 +49,26 @@ func (t *forceFallbackTransport) RoundTrip(req *http.Request) (*http.Response, e
 	return t.wrapped.RoundTrip(req)
 }
 
+// dropCountingTransport counts DELETE requests: a swap that issued none
+// took the single-call register-with-overwrite path.
+type dropCountingTransport struct {
+	wrapped http.RoundTripper
+	drops   int
+}
+
+func (t *dropCountingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Method == http.MethodDelete {
+		t.drops++
+	}
+	return t.wrapped.RoundTrip(req)
+}
+
 // TestMigrateOne_E2E_Lakekeeper_DropRegisterFallback verifies the
 // drop+register fallback path works end-to-end against a real
 // Lakekeeper, even when atomic register?overwrite=true is unavailable.
 //
-// Lakekeeper v0.12.0 supports overwrite=true natively, so the default
-// migrate test exercises the atomic path. Without this test, the
+// Lakekeeper v0.12.4 swaps in one call when overwrite is in the request
+// body, so the default migrate test exercises the single-call path. Without this test, the
 // fallback path is only covered by httptest mocks and would silently
 // rot if a future refactor broke the drop+register sequence — until a
 // production user with an older Lakekeeper hit it.
@@ -154,7 +168,7 @@ func TestMigrateOne_E2E_Lakekeeper_DropRegisterFallback(t *testing.T) {
 		t.Errorf("post-rebase pointer: have %q, want %q", reloaded.MetadataLocation, wantNewLoc)
 	}
 
-	if err := rewrite.ValidateAfterSwap(ctx, store, wantNewLoc); err != nil {
+	if err := rewrite.ValidateAfterSwap(ctx, store, wantNewLoc, eng.Opts.Mapping); err != nil {
 		t.Errorf("ValidateAfterSwap: %v", err)
 	}
 }

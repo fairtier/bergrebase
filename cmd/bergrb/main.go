@@ -423,10 +423,18 @@ func migrateOne(ctx context.Context, cat catalog.Catalog, engine *rewrite.Engine
 	// Treat that as "already migrated" rather than failing the
 	// source-prefix check inside RewriteTable, so a re-run over a
 	// partially migrated namespace converges instead of erroring on the
-	// tables that already made it across.
+	// tables that already made it across. It still validates: an earlier run
+	// that swapped and then failed validation must not turn into exit 0 here,
+	// or an operator deletes the source with data files missing from the target.
 	if strings.HasPrefix(tbl.MetadataLocation, cfg.targetPrefix) {
-		slog.Info("table already migrated; skipping",
+		slog.Info("table already migrated; nothing to rewrite",
 			"table", qualifiedName(id), "metadata_location", tbl.MetadataLocation)
+		if cfg.noValidate {
+			return nil
+		}
+		if err := validateAfterSwap(ctx, cat, target, engine.Opts.Mapping, id, tbl.MetadataLocation, tbl.CurrentSnapshotID); err != nil {
+			return fmt.Errorf("already-migrated table failed validation: %w", err)
+		}
 		return nil
 	}
 
@@ -454,17 +462,18 @@ func migrateOne(ctx context.Context, cat catalog.Catalog, engine *rewrite.Engine
 	if cfg.noValidate {
 		return nil
 	}
-	if err := validateAfterSwap(ctx, cat, target, id, res.NewMetadataLocation, tbl.CurrentSnapshotID); err != nil {
+	if err := validateAfterSwap(ctx, cat, target, engine.Opts.Mapping, id, res.NewMetadataLocation, tbl.CurrentSnapshotID); err != nil {
 		return fmt.Errorf("post-swap validation: %w", err)
 	}
 	return nil
 }
 
 // validateAfterSwap performs the catalog-side and storage-side halves
-// of the post-rebase validation. It is best-effort: a true correctness
-// proof would re-read every data file's footer and compare per-column
-// bounds.
-func validateAfterSwap(ctx context.Context, cat catalog.Catalog, target rewrite.Storage, id catalog.Identifier, expectedLoc string, expectedSnap *int64) error {
+// of the post-rebase validation: the catalog resolves expectedLoc, and
+// every live data/delete file of the current snapshot exists on target
+// with no metadata URI left under the source prefix. It checks presence,
+// not content.
+func validateAfterSwap(ctx context.Context, cat catalog.Catalog, target rewrite.Storage, mapping rewrite.PrefixMapping, id catalog.Identifier, expectedLoc string, expectedSnap *int64) error {
 	reloaded, err := cat.LoadTable(ctx, id)
 	if err != nil {
 		return fmt.Errorf("reload after swap: %w", err)
@@ -477,7 +486,7 @@ func validateAfterSwap(ctx context.Context, cat catalog.Catalog, target rewrite.
 		return fmt.Errorf("current-snapshot-id drifted: have %v, expected %v",
 			snapshotID(reloaded.CurrentSnapshotID), snapshotID(expectedSnap))
 	}
-	return rewrite.ValidateAfterSwap(ctx, target, expectedLoc)
+	return rewrite.ValidateAfterSwap(ctx, target, expectedLoc, mapping)
 }
 
 func snapshotIDsEqual(a, b *int64) bool {

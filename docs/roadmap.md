@@ -12,8 +12,8 @@ needs a Go Puffin reader/writer (see [`puffin.md`](./puffin.md)).
 
 | Catalog                                 | Status                       | Notes                                                                                                                                                                                            |
 |-----------------------------------------|------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| Lakekeeper (REST)                       | supported                    | Primary target. v0.12.0 supports atomic `register?overwrite=true` (auto-detected); the drop+register fallback is locked in by `TestMigrateOne_E2E_Lakekeeper_DropRegisterFallback`.              |
-| Apache Polaris (REST)                   | supported                    | Tested via `TestMigrateOne_E2E_Polaris` (testcontainer); same `rest.Client` as Lakekeeper. Atomic swap via `register?overwrite=true` (auto-detected on first swap; falls back to drop+register). |
+| Lakekeeper (REST)                       | supported                    | Primary target. v0.12.4 swaps atomically when `overwrite` is in the register body (asserted); the drop+register fallback is locked in by `TestMigrateOne_E2E_Lakekeeper_DropRegisterFallback`. |
+| Apache Polaris (REST)                   | supported                    | Tested via `TestMigrateOne_E2E_Polaris` (testcontainer); same `rest.Client` as Lakekeeper. Polaris 1.4.0 does not honour `overwrite`: swaps by drop+register, **not atomic** (pinned by the test). |
 | Tabular / Snowflake Open Catalog (REST) | supported                    | Same REST contract.                                                                                                                                                                              |
 | AWS Glue REST shim                      | supported                    | Same REST contract.                                                                                                                                                                              |
 | Nessie (REST)                           | best-effort                  | Branch/tag model differs; needs testing.                                                                                                                                                         |
@@ -58,9 +58,11 @@ workflow publishes the corresponding container image.
 ## Test coverage status
 
 Per [`testing.md`](./testing.md) merge-gate scenarios (1-9, 11, 13, 15,
-16, 17). Engine-level path-rewrite is covered by hand-built fixtures
-that exercise the same code paths a real writer would produce. The
-DuckDB oracle (count + checksum equivalence after rebase) is **wired
+16, 17), plus `TestRealWriters_*`, which run real DuckDB and pyiceberg
+writers through Lakekeeper and the real binary. Engine-level path-rewrite
+is otherwise covered by hand-built fixtures, which do **not** reproduce
+what real writers emit; every bug the real-writer tests found had passed
+them. The DuckDB oracle (count + checksum equivalence after rebase) is **wired
 for scenarios 1, 2, 3, 5, 9, and 11** — every read-side scenario in
 the merge-gate set. Each oracle test seeds real Parquet, runs an
 `iceberg_scan` pre-rebase, runs the engine, and asserts an identical
@@ -71,7 +73,7 @@ lost their sequence numbers (`preserveSequenceNumbers` in
 
 | #  | Scenario             | Test                                                                                                                                                                    | Notes                                                                                                                                                                                                                          |
 |----|----------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| 1  | V2 basic             | `TestMigrateOne_E2E_Lakekeeper`, `TestMigrateOne_E2E_Polaris`, `TestMigrateOne_E2E_Lakekeeper_DropRegisterFallback`, `TestEngine_E2E_MinIO`, `TestDuckDBOracle_V2Basic` | Full migrateOne against both Lakekeeper and Polaris (atomic path), plus a Lakekeeper run with the atomic probe forced to 409 to exercise drop+register against a real catalog. DuckDB oracle confirms post-rebase readability. |
+| 1  | V2 basic             | `TestMigrateOne_E2E_Lakekeeper`, `TestMigrateOne_E2E_Polaris`, `TestMigrateOne_E2E_Lakekeeper_DropRegisterFallback`, `TestEngine_E2E_MinIO`, `TestDuckDBOracle_V2Basic` | Full migrateOne against Lakekeeper (single-call path) and Polaris (drop+register), plus a Lakekeeper run with the atomic probe forced to 409 to exercise drop+register against a real catalog. DuckDB oracle confirms post-rebase readability. |
 | 2  | V2 multi-snapshot    | `TestEngine_E2E_MultiSnapshot`, `TestDuckDBOracle_MultiSnapshot`                                                                                                        | DuckDB oracle covers carry-forward manifests.                                                                                                                                                                                  |
 | 3  | V2 partitioned       | `TestEngine_E2E_Partitioned`, `TestDuckDBOracle_Partitioned`                                                                                                            | Partition values + multi-column field IDs round-trip.                                                                                                                                                                          |
 | 4  | V2 wide (1000 files) | `TestMigrateOne_E2E_V2Wide`                                                                                                                                             | Perf bound (60 s) on a 1000-entry manifest. Nightly CI gated by `BERGREBASE_NIGHTLY=1`, not merge gate.                                                                                                                        |
@@ -101,7 +103,8 @@ real work tracked separately from the v1.0 milestone.
    one and Lakekeeper refuses the read. Mitigation: round-trip every
    written manifest and compare lengths before catalog swap; assertion
    covered by acceptance criterion #1 in [`testing.md`](./testing.md).
-3. **Best-effort validation**. `LoadTable` + HEAD + `count(*)` is not a
+3. **Best-effort validation**. `LoadTable` + source-prefix check + HEAD of
+   every live file is not a
    correctness proof — true correctness would compare every data-file
    checksum. Acceptable for v1; documented limit in
    [`testing.md`](./testing.md).
@@ -116,8 +119,8 @@ real work tracked separately from the v1.0 milestone.
    versions. The REST client auto-detects on the first swap (probe
    `?overwrite=true`; cache `atomic` on 2xx, cache `drop+register` on
    409 / `AlreadyExistsException`) and uses the cached path for the
-   rest of the run. Polaris and recent Lakekeeper hit the atomic path;
-   older Lakekeeper falls back. Rollback behaviour for the fallback
+   rest of the run. Lakekeeper v0.12.4 hits the atomic path (it needs
+   `overwrite` in the body); Polaris 1.4.0 falls back. Rollback behaviour for the fallback
    path is covered by scenario 15.
 7. **`register-view` REST endpoint: spec landed, awaiting vendor
    implementations.** Apache Iceberg standardized
@@ -143,17 +146,4 @@ real work tracked separately from the v1.0 milestone.
   every URI references the target prefix (drift detection).
 - Parallelisation across tables: today the engine processes tables
   sequentially; for large catalogs an `--jobs N` flag would help.
-- DuckDB oracle through the Lakekeeper REST catalog instead of
-  `iceberg_scan(metadata.json)`. Today's oracle proves the rewritten
-  metadata graph is queryable; a catalog-attach variant would also
-  exercise the swap end-to-end through DuckDB.
-- A DELETED-status CoW oracle. Today's `TestDuckDBOracle_CoW` uses
-  the "overwrite" pattern (snap N's list drops the previous
-  manifest); a variant that carries the old manifest forward and
-  exercises status=DELETED on a data-file entry would cover
-  RewriteManifest's pass-through behaviour for delete-marking
-  entries (distinct from V2 position-/equality-delete content
-  manifests, which are now exercised by
-  `TestDuckDBOracle_V2PositionDeletes` and
-  `TestDuckDBOracle_V2EqualityDeletes`).
 - `--validate-with-duckdb` flag in `cmd/bergrb` per `testing.md`.

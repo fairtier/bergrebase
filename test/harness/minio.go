@@ -69,7 +69,7 @@ func StartMinIO(ctx context.Context, t *testing.T) *MinIO {
 	c, err := minio.Run(ctx, img)
 	if err != nil {
 		if isDockerUnavailable(err) {
-			t.Skipf("docker unavailable, skipping testcontainers test: %v", err)
+			SkipOrFail(t, "docker unavailable, skipping testcontainers test: %v", err)
 		}
 		t.Fatalf("minio.Run: %v", err)
 	}

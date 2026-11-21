@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -58,10 +59,12 @@ func TestMigrateOne_E2E_Polaris(t *testing.T) {
 	s.CreateNamespace(ctx, t, ns)
 	s.RegisterTable(ctx, t, ns, tableName, seed.MetadataURI)
 
+	transport := &dropCountingTransport{wrapped: http.DefaultTransport}
 	cat := rest.New(rest.Config{
-		URI:       s.Polaris.BaseURI,
-		Warehouse: s.Polaris.Warehouse,
-		Token:     s.Polaris.Token,
+		URI:        s.Polaris.BaseURI,
+		Warehouse:  s.Polaris.Warehouse,
+		Token:      s.Polaris.Token,
+		HTTPClient: &http.Client{Transport: transport},
 	})
 	id := catalog.Identifier{Namespace: ns, Name: tableName}
 	tbl, err := cat.LoadTable(ctx, id)
@@ -117,6 +120,12 @@ func TestMigrateOne_E2E_Polaris(t *testing.T) {
 	if err := cat.SwapMetadataLocation(ctx, id, tbl.MetadataLocation, res.NewMetadataLocation); err != nil {
 		t.Fatalf("SwapMetadataLocation: %v", err)
 	}
+	// Polaris 1.4.0 does not honour overwrite on register (query or body),
+	// so the swap is drop+register: NOT atomic. Pinned so the docs, which
+	// say so, get revisited when a Polaris upgrade changes it.
+	if transport.drops != 1 {
+		t.Errorf("swap issued %d DELETE(s); Polaris 1.4.0 is expected to take the drop+register fallback (1)", transport.drops)
+	}
 
 	reloaded, err := cat.LoadTable(ctx, id)
 	if err != nil {
@@ -126,7 +135,7 @@ func TestMigrateOne_E2E_Polaris(t *testing.T) {
 		t.Errorf("post-rebase pointer: have %q, want %q", reloaded.MetadataLocation, wantNewLoc)
 	}
 
-	if err := rewrite.ValidateAfterSwap(ctx, store, wantNewLoc); err != nil {
+	if err := rewrite.ValidateAfterSwap(ctx, store, wantNewLoc, eng.Opts.Mapping); err != nil {
 		t.Errorf("ValidateAfterSwap: %v", err)
 	}
 }

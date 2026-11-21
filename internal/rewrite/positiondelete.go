@@ -45,9 +45,14 @@ type PositionDeleteRewrite struct {
 // against missing files. This rewriter is the only place those URIs
 // get fixed.
 //
-// Idempotency: if sourceURI doesn't begin with mapping.Source, the
-// function returns sourceURI unchanged (NewSize=-1) and writes nothing
-// — same convention as RewriteTable. Re-runs against an already-
+// Outside the source prefix: if sourceURI doesn't begin with mapping.Source,
+// the function returns sourceURI unchanged (NewSize=-1) and writes nothing —
+// unless a row names a data file under the source prefix. That data file is
+// moving while this delete file cannot be rewritten, so the delete would stop
+// applying and its rows would silently come back: ErrOutsidePrefix. Checking
+// this means the body has to be readable with the source credentials.
+//
+// Idempotency: re-runs against an already-
 // rewritten file under the source path are no-ops because every row
 // already matches the target prefix; NewSize then reports the length
 // of the previously rewritten bytes so the caller can still correct a
@@ -61,6 +66,9 @@ type PositionDeleteRewrite struct {
 // confirmed full-successful migration is the requirement.
 func RewritePositionDeleteFile(ctx context.Context, src, dst Storage, sourceURI string, mapping PrefixMapping) (PositionDeleteRewrite, error) {
 	if !mapping.Matches(sourceURI) {
+		if err := refuseOutsidePrefixRows(ctx, src, sourceURI, mapping); err != nil {
+			return PositionDeleteRewrite{}, err
+		}
 		return PositionDeleteRewrite{NewURI: sourceURI, NewSize: -1}, nil
 	}
 
@@ -141,7 +149,7 @@ func RewritePositionDeleteFile(ctx context.Context, src, dst Storage, sourceURI 
 // live rewrite fails the dry-run walk with the same error.
 func WalkPositionDeleteFile(ctx context.Context, src Storage, sourceURI string, mapping PrefixMapping) error {
 	if !mapping.Matches(sourceURI) {
-		return nil
+		return refuseOutsidePrefixRows(ctx, src, sourceURI, mapping)
 	}
 	raw, err := src.GetObject(ctx, sourceURI)
 	if err != nil {
@@ -163,6 +171,33 @@ func WalkPositionDeleteFile(ctx context.Context, src Storage, sourceURI string, 
 			return err
 		}
 		rewritten.Release()
+	}
+	return nil
+}
+
+// refuseOutsidePrefixRows returns ErrOutsidePrefix if a position-delete file
+// outside the source prefix has a row naming a data file inside it.
+func refuseOutsidePrefixRows(ctx context.Context, src Storage, sourceURI string, mapping PrefixMapping) error {
+	raw, err := src.GetObject(ctx, sourceURI)
+	if err != nil {
+		return fmt.Errorf("read position-delete %s (outside source prefix, needed to check its rows): %w", sourceURI, err)
+	}
+	tbl, fpIdx, err := openPositionDelete(ctx, raw, sourceURI)
+	if err != nil {
+		return err
+	}
+	defer tbl.Release()
+	for _, chunk := range tbl.Column(fpIdx).Data().Chunks() {
+		strCol, ok := chunk.(*array.String)
+		if !ok {
+			return fmt.Errorf("position-delete %s: file_path column is %T, expected *array.String", sourceURI, chunk)
+		}
+		for i := range strCol.Len() {
+			if !strCol.IsNull(i) && mapping.Matches(strCol.Value(i)) {
+				return fmt.Errorf("%w: position-delete file %s is outside source prefix %q but deletes rows from %s; the delete would stop applying",
+					ErrOutsidePrefix, sourceURI, mapping.Source, strCol.Value(i))
+			}
+		}
 	}
 	return nil
 }

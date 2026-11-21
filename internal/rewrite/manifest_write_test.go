@@ -243,7 +243,8 @@ func TestRewriteManifestList_RoundTripV2(t *testing.T) {
 	const listURI = "s3://x/snap-1.avro"
 
 	seq := int64(1)
-	hdr := ManifestListHeader{SnapshotID: 1, SequenceNumber: &seq}
+	snapshotID := int64(1)
+	hdr := ManifestListHeader{SnapshotID: &snapshotID, SequenceNumber: &seq}
 	mapping := PrefixMapping{Source: "s3://nonmatching/", Target: "s3://other/"}
 	newURI, err := RewriteManifestList(context.Background(), store, listURI, mapping, 2, hdr, []iceberg.ManifestFile{mf1, mf2})
 	if err != nil {

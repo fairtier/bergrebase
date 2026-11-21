@@ -7,14 +7,12 @@ import (
 
 // MaybeSkipNotNightly skips t unless BERGREBASE_NIGHTLY=1.
 //
-// Used for the perf and resume scenarios that are deferred to nightly
-// CI: failures open an issue but do not block merges. The default `go
-// test ./test/...` run keeps these tests out of the merge-gate path
-// while leaving them in the package so they continue to compile and
-// type-check.
+// Used for the slower perf, resume and large-scale scenarios. A plain local
+// `go test ./test/...` stays quick by leaving them out; CI sets the variable,
+// so they run on every PR (there is no separate nightly workflow).
 func MaybeSkipNotNightly(t *testing.T) {
 	t.Helper()
 	if os.Getenv("BERGREBASE_NIGHTLY") == "" {
-		t.Skip("nightly-only; set BERGREBASE_NIGHTLY=1 to run")
+		SkipOrFail(t, "nightly-only; set BERGREBASE_NIGHTLY=1 to run")
 	}
 }

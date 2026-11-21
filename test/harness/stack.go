@@ -22,9 +22,10 @@ import (
 	bergstorage "github.com/fairtier/bergrebase/internal/storage"
 )
 
-// defaultLakekeeperImage is the Lakekeeper container image. Override via
+// defaultLakekeeperImage is the Lakekeeper container image, kept on the
+// version FairTier workspaces run. Override via
 // BERGREBASE_TEST_LAKEKEEPER_IMAGE if upstream renames the tag.
-const defaultLakekeeperImage = "quay.io/lakekeeper/catalog:v0.12.0"
+const defaultLakekeeperImage = "quay.io/lakekeeper/catalog:v0.12.4"
 
 // defaultPostgresImage is the PostgreSQL backend Lakekeeper requires.
 const defaultPostgresImage = "postgres:16-alpine"
@@ -37,7 +38,8 @@ type Stack struct {
 	MinIO      *MinIO
 	Lakekeeper *LakekeeperHandle
 
-	network *testcontainers.DockerNetwork
+	network  *testcontainers.DockerNetwork
+	postgres *postgres.PostgresContainer
 }
 
 // LakekeeperHandle holds the parts of a running Lakekeeper instance the
@@ -68,14 +70,14 @@ func StartStack(ctx context.Context, t *testing.T) *Stack {
 	net, err := network.New(ctx)
 	if err != nil {
 		if isDockerUnavailable(err) {
-			t.Skipf("docker unavailable, skipping testcontainers test: %v", err)
+			SkipOrFail(t, "docker unavailable, skipping testcontainers test: %v", err)
 		}
 		t.Fatalf("network.New: %v", err)
 	}
 	t.Cleanup(func() { _ = net.Remove(context.Background()) })
 
 	mi := startMinIOOnNetwork(ctx, t, net.Name)
-	startPostgresOnNetwork(ctx, t, net.Name)
+	pg := startPostgresOnNetwork(ctx, t, net.Name)
 	runLakekeeperMigrate(ctx, t, net.Name)
 	lake := startLakekeeperOnNetwork(ctx, t, net.Name)
 	bootstrapLakekeeper(ctx, t, lake.BaseURI)
@@ -85,6 +87,7 @@ func StartStack(ctx context.Context, t *testing.T) *Stack {
 		MinIO:      mi,
 		Lakekeeper: lake,
 		network:    net,
+		postgres:   pg,
 	}
 }
 
@@ -103,7 +106,7 @@ func startMinIOOnNetwork(ctx context.Context, t *testing.T, networkName string) 
 	)
 	if err != nil {
 		if isDockerUnavailable(err) {
-			t.Skipf("docker unavailable: %v", err)
+			SkipOrFail(t, "docker unavailable: %v", err)
 		}
 		t.Fatalf("minio.Run on network: %v", err)
 	}
@@ -197,7 +200,6 @@ func startLakekeeperOnNetwork(ctx context.Context, t *testing.T, networkName str
 			"LAKEKEEPER__PG_DATABASE_URL_READ":  pgURL,
 			"LAKEKEEPER__PG_DATABASE_URL_WRITE": pgURL,
 			"LAKEKEEPER__AUTHZ_BACKEND":         "allowall",
-			"LAKEKEEPER__BASE_URI":              "http://lakekeeper:8181",
 			"RUST_LOG":                          "info",
 		},
 		Networks: []string{networkName},
