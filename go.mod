@@ -14,7 +14,7 @@ require (
 	github.com/testcontainers/testcontainers-go v0.45.0
 	github.com/testcontainers/testcontainers-go/modules/minio v0.45.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.45.0
-	github.com/twmb/avro v1.9.0
+	github.com/twmb/avro v1.9.1
 )
 
 require (
